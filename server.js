@@ -24,7 +24,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = process.env.PORT || 3001;
-const DEFAULT_GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
+const DEFAULT_VERTEX_MODEL = process.env.VERTEX_MODEL || 'gemini-2.5-flash';
 
 let courseReferenceCache = null;
 
@@ -379,11 +379,50 @@ function buildFallbackSummary({ studentInfo, goals, requestedCourses, validation
   };
 }
 
-async function fetchGroqTranscriptSummary({ studentInfo, requestedCourses, goals, validation, reference }) {
-  const apiKey = process.env.GROQ_API_KEY;
+async function callVertexModel({ systemInstruction, prompt, temperature = 0.2 }) {
+  const apiKey = process.env.VERTEX_API_KEY;
   if (!apiKey) {
-    throw new Error('Missing GROQ_API_KEY');
+    throw new Error('Missing VERTEX_API_KEY');
   }
+
+  const response = await fetch(`https://aiplatform.googleapis.com/v1/publishers/google/models/${DEFAULT_VERTEX_MODEL}:generateContent`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': apiKey,
+    },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [{ text: systemInstruction }],
+      },
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: prompt }],
+        },
+      ],
+      generationConfig: {
+        temperature,
+        responseMimeType: 'application/json',
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Vertex request failed: ${response.status} ${errorText}`);
+  }
+
+  const data = await response.json();
+  const text = data?.candidates?.[0]?.content?.parts?.map((part) => part?.text || '').join('').trim() || '';
+  if (!text) {
+    throw new Error('Vertex returned an empty response');
+  }
+
+  return text;
+}
+
+async function fetchVertexTranscriptSummary({ studentInfo, requestedCourses, goals, validation, reference }) {
 
   const completedCourses = [
     ...(validation?.completedCoreRequirements || []),
@@ -422,39 +461,15 @@ async function fetchGroqTranscriptSummary({ studentInfo, requestedCourses, goals
     `Unknown courses: ${JSON.stringify(unknownCourses)}`,
   ].join('\n');
 
-  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: DEFAULT_GROQ_MODEL,
-      temperature: 0.2,
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a precise academic advising assistant. Output JSON only.',
-        },
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-    }),
+  const text = await callVertexModel({
+    systemInstruction: 'You are a precise academic advising assistant. Output JSON only.',
+    prompt,
+    temperature: 0.2,
   });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Groq summary request failed: ${response.status} ${errorText}`);
-  }
-
-  const data = await response.json();
-  const text = data?.choices?.[0]?.message?.content || '';
   const parsed = extractJsonObject(text);
 
   if (!parsed || typeof parsed !== 'object') {
-    throw new Error('Groq returned non-JSON summary');
+    throw new Error('Vertex returned non-JSON summary');
   }
 
   return {
@@ -462,16 +477,11 @@ async function fetchGroqTranscriptSummary({ studentInfo, requestedCourses, goals
     summary: String(parsed.summary || '').trim(),
     recommendations: Array.isArray(parsed.recommendations) ? parsed.recommendations.map((item) => String(item).trim()).filter(Boolean).slice(0, 4) : [],
     risks: Array.isArray(parsed.risks) ? parsed.risks.map((item) => String(item).trim()).filter(Boolean).slice(0, 4) : [],
-    source: 'groq',
+    source: 'vertex',
   };
 }
 
-async function fetchGroqSuggestions({ requestedCourses, goals, studentInfo, validation, reference }) {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) {
-    throw new Error('Missing GROQ_API_KEY');
-  }
-
+async function fetchVertexSuggestions({ requestedCourses, goals, studentInfo, validation, reference }) {
   const completedCourses = [
     ...(validation?.completedCoreRequirements || []),
     ...(validation?.completedMathRequirements || []),
@@ -509,39 +519,15 @@ async function fetchGroqSuggestions({ requestedCourses, goals, studentInfo, vali
     `Elective options: ${JSON.stringify(electiveOptions)}`,
   ].join('\n');
 
-  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: DEFAULT_GROQ_MODEL,
-      temperature: 0.2,
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a precise academic advising assistant. Output JSON only.',
-        },
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-    }),
+  const text = await callVertexModel({
+    systemInstruction: 'You are a precise academic advising assistant. Output JSON only.',
+    prompt,
+    temperature: 0.2,
   });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Groq request failed: ${response.status} ${errorText}`);
-  }
-
-  const data = await response.json();
-  const text = data?.choices?.[0]?.message?.content || '';
   const parsed = extractJsonArray(text);
 
   if (!Array.isArray(parsed)) {
-    throw new Error('Groq returned non-JSON suggestions');
+    throw new Error('Vertex returned non-JSON suggestions');
   }
 
   return parsed
@@ -554,12 +540,7 @@ async function fetchGroqSuggestions({ requestedCourses, goals, studentInfo, vali
     .slice(0, 6);
 }
 
-async function fetchGroqSchedulePlan({ requestedCourses, goals, studentInfo, validation, reference }) {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) {
-    throw new Error('Missing GROQ_API_KEY');
-  }
-
+async function fetchVertexSchedulePlan({ requestedCourses, goals, studentInfo, validation, reference }) {
   const protectedCourses = [...(validation?.completedOrProtectedCourses || [])].map((code) => ({
     code: normalizeCourseCode(code),
     title: getCourseTitle(reference, code),
@@ -594,39 +575,15 @@ async function fetchGroqSchedulePlan({ requestedCourses, goals, studentInfo, val
     `Eligible option candidates: ${JSON.stringify(eligibleOptions)}`,
   ].join('\n');
 
-  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: DEFAULT_GROQ_MODEL,
-      temperature: 0.2,
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a precise academic advising assistant. Output JSON only.',
-        },
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-    }),
+  const text = await callVertexModel({
+    systemInstruction: 'You are a precise academic advising assistant. Output JSON only.',
+    prompt,
+    temperature: 0.2,
   });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Groq schedule request failed: ${response.status} ${errorText}`);
-  }
-
-  const data = await response.json();
-  const text = data?.choices?.[0]?.message?.content || '';
   const parsed = extractJsonArray(text);
 
   if (!Array.isArray(parsed)) {
-    throw new Error('Groq returned non-JSON schedule');
+    throw new Error('Vertex returned non-JSON schedule');
   }
 
   return parsed
@@ -999,19 +956,19 @@ app.post('/api/submit', upload.fields([
     });
 
     try {
-      aiSummary = await fetchGroqTranscriptSummary({
+      aiSummary = await fetchVertexTranscriptSummary({
         studentInfo: student,
         requestedCourses,
         goals,
         validation: validationResult,
         reference,
       });
-    } catch (groqError) {
-      console.error('Groq summary error:', groqError.message);
+    } catch (vertexError) {
+      console.error('Vertex summary error:', vertexError.message);
     }
 
     try {
-      const groqSchedule = await fetchGroqSchedulePlan({
+      const vertexSchedule = await fetchVertexSchedulePlan({
         studentInfo: student,
         requestedCourses,
         goals,
@@ -1019,11 +976,11 @@ app.post('/api/submit', upload.fields([
         reference,
       });
 
-      if (groqSchedule.length > 0) {
-        recommendedSchedule = groqSchedule;
+      if (vertexSchedule.length > 0) {
+        recommendedSchedule = vertexSchedule;
       }
-    } catch (groqError) {
-      console.error('Groq schedule error:', groqError.message);
+    } catch (vertexError) {
+      console.error('Vertex schedule error:', vertexError.message);
     }
 
     const transcriptId = `transcript_${Date.now()}`;
@@ -1097,7 +1054,7 @@ app.post('/api/suggest-courses', async (req, res) => {
     const fallbackSuggestions = buildFallbackSuggestions(reference, requestedCourses, validation);
 
     try {
-      const suggestions = await fetchGroqSuggestions({
+      const suggestions = await fetchVertexSuggestions({
         requestedCourses,
         goals,
         studentInfo,
@@ -1107,10 +1064,10 @@ app.post('/api/suggest-courses', async (req, res) => {
 
       return res.json({
         suggestions: suggestions.length > 0 ? suggestions : fallbackSuggestions,
-        source: suggestions.length > 0 ? 'groq' : 'fallback',
+        source: suggestions.length > 0 ? 'vertex' : 'fallback',
       });
-    } catch (groqError) {
-      console.error('Groq suggestion error:', groqError.message);
+    } catch (vertexError) {
+      console.error('Vertex suggestion error:', vertexError.message);
       return res.json({
         suggestions: fallbackSuggestions,
         source: 'fallback',

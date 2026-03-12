@@ -102,7 +102,7 @@ export default function Results() {
                   {aiSummary.headline || 'Transcript Summary'}
                   {aiSummary.source && (
                     <span style={{ color: 'var(--muted)', fontWeight: 500 }}>
-                      {aiSummary.source === 'groq' ? 'Groq' : 'Fallback'}
+                      {aiSummary.source === 'vertex' ? 'Vertex' : 'Fallback'}
                     </span>
                   )}
                 </div>
