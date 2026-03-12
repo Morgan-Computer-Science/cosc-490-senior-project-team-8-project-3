@@ -1,0 +1,85 @@
+{
+  "program": {
+    "institution": "Morgan State University",
+    "programName": "Computer Science B.S.",
+    "degreeType": "BS",
+    "catalogYear": null
+  },
+  "requirements": {
+    "csCore": [
+      { "id": "CS_CORE_COSC111", "courseCode": "COSC111", "displayCode": "COSC 111", "courseName": "Introduction to Computer Science I", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC112", "courseCode": "COSC112", "displayCode": "COSC 112", "courseName": "Introduction to Computer Science II", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC220", "courseCode": "COSC220", "displayCode": "COSC 220", "courseName": "Data Structures and Algorithms", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC241", "courseCode": "COSC241", "displayCode": "COSC 241", "courseName": "Computer Systems and Digital Logic", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC281", "courseCode": "COSC281", "displayCode": "COSC 281", "courseName": "Discrete Structures", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC349", "courseCode": "COSC349", "displayCode": "COSC 349", "courseName": "Computer Networks", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC351", "courseCode": "COSC351", "displayCode": "COSC 351", "courseName": "Cybersecurity", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC352", "courseCode": "COSC352", "displayCode": "COSC 352", "courseName": "Organization of Programming Languages", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC354", "courseCode": "COSC354", "displayCode": "COSC 354", "courseName": "Operating Systems", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC458", "courseCode": "COSC458", "displayCode": "COSC 458", "courseName": "Software Engineering", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC459", "courseCode": "COSC459", "displayCode": "COSC 459", "courseName": "Database Design", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true },
+      { "id": "CS_CORE_COSC490", "courseCode": "COSC490", "displayCode": "COSC 490", "courseName": "Senior Project", "credits": null, "category": "CS_CORE", "requirementGroup": null, "isRequired": true }
+    ],
+    "supportingRequired": [
+      { "id": "SUPPORT_COSC201", "courseCode": "COSC201", "displayCode": "COSC 201", "courseName": "Computer Ethics", "credits": null, "category": "SUPPORTING_REQUIRED", "requirementGroup": null, "isRequired": true }
+    ],
+    "mathRequired": [
+      { "id": "MATH_REQ_MATH241", "courseCode": "MATH241", "displayCode": "MATH 241", "courseName": "Calculus I", "credits": null, "category": "MATH_REQUIRED", "requirementGroup": null, "isRequired": true },
+      { "id": "MATH_REQ_MATH242", "courseCode": "MATH242", "displayCode": "MATH 242", "courseName": "Calculus II", "credits": null, "category": "MATH_REQUIRED", "requirementGroup": null, "isRequired": true },
+      { "id": "MATH_REQ_MATH312", "courseCode": "MATH312", "displayCode": "MATH 312", "courseName": "Linear Algebra I", "credits": null, "category": "MATH_REQUIRED", "requirementGroup": null, "isRequired": true },
+      { "id": "MATH_REQ_MATH331", "courseCode": "MATH331", "displayCode": "MATH 331", "courseName": "Applied Probability and Statistics", "credits": null, "category": "MATH_REQUIRED", "requirementGroup": null, "isRequired": true }
+    ],
+    "genEdRequired": [
+      {
+        "id": "GEN_ED_ENGL101_OR_ENGL111",
+        "requirementName": "First composition requirement",
+        "credits": null,
+        "category": "GEN_ED_REQUIRED",
+        "requirementGroup": "COMPOSITION_1",
+        "isRequired": true,
+        "courseOptions": [
+          { "courseCode": "ENGL101", "displayCode": "ENGL 101", "courseName": null },
+          { "courseCode": "ENGL111", "displayCode": "ENGL 111", "courseName": null }
+        ]
+      },
+      {
+        "id": "GEN_ED_ENGL102_OR_ENGL112",
+        "requirementName": "Second composition requirement",
+        "credits": null,
+        "category": "GEN_ED_REQUIRED",
+        "requirementGroup": "COMPOSITION_2",
+        "isRequired": true,
+        "courseOptions": [
+          { "courseCode": "ENGL102", "displayCode": "ENGL 102", "courseName": null },
+          { "courseCode": "ENGL112", "displayCode": "ENGL 112", "courseName": null }
+        ]
+      },
+      { "id": "GEN_ED_ORNS106", "courseCode": "ORNS106", "displayCode": "ORNS 106", "courseName": null, "credits": null, "category": "GEN_ED_REQUIRED", "requirementGroup": "ORIENTATION", "isRequired": true },
+      { "id": "GEN_ED_MATH241", "courseCode": "MATH241", "displayCode": "MATH 241", "courseName": "Calculus I", "credits": null, "category": "GEN_ED_REQUIRED", "requirementGroup": "QUANTITATIVE", "isRequired": true },
+      { "id": "GEN_ED_COSC111", "courseCode": "COSC111", "displayCode": "COSC 111", "courseName": "Introduction to Computer Science I", "credits": null, "category": "GEN_ED_REQUIRED", "requirementGroup": "MAJOR_GATEWAY", "isRequired": true }
+    ],
+    "genEdElectives": [
+      { "id": "GEN_ED_HH", "requirementName": "HH requirement", "credits": null, "category": "GEN_ED_ELECTIVE", "requirementGroup": "HH", "isRequired": false, "placeholder": true, "requiredCount": 1, "courseOptions": [] },
+      { "id": "GEN_ED_AH_1", "requirementName": "AH requirement", "credits": null, "category": "GEN_ED_ELECTIVE", "requirementGroup": "AH", "isRequired": false, "placeholder": true, "requiredCount": 2, "courseOptions": [] },
+      { "id": "GEN_ED_BP_LAB", "requirementName": "BP requirement with lab", "credits": null, "category": "GEN_ED_ELECTIVE", "requirementGroup": "BP_WITH_LAB", "isRequired": false, "placeholder": true, "requiredCount": 1, "courseOptions": [] },
+      { "id": "GEN_ED_BP_NO_LAB", "requirementName": "BP requirement without lab", "credits": null, "category": "GEN_ED_ELECTIVE", "requirementGroup": "BP_WITHOUT_LAB", "isRequired": false, "placeholder": true, "requiredCount": 1, "courseOptions": [] },
+      { "id": "GEN_ED_SB", "requirementName": "SB requirement", "credits": null, "category": "GEN_ED_ELECTIVE", "requirementGroup": "SB", "isRequired": false, "placeholder": true, "requiredCount": 2, "courseOptions": [] },
+      { "id": "GEN_ED_CI", "requirementName": "CI requirement", "credits": null, "category": "GEN_ED_ELECTIVE", "requirementGroup": "CI", "isRequired": false, "placeholder": true, "requiredCount": 1, "courseOptions": [] },
+      { "id": "GEN_ED_CT", "requirementName": "CT requirement", "credits": null, "category": "GEN_ED_ELECTIVE", "requirementGroup": "CT", "isRequired": false, "placeholder": true, "requiredCount": 1, "courseOptions": [] },
+      {
+        "id": "GEN_ED_WELLNESS",
+        "requirementName": "Physical Activity or FIN 101 or MIND 101",
+        "credits": null,
+        "category": "GEN_ED_ELECTIVE",
+        "requirementGroup": "WELLNESS",
+        "isRequired": false,
+        "placeholder": true,
+        "requiredCount": 1,
+        "courseOptions": [
+          { "courseCode": "FIN101", "displayCode": "FIN 101", "courseName": null },
+          { "courseCode": "MIND101", "displayCode": "MIND 101", "courseName": null }
+        ]
+      }
+    ]
+  }
+}
