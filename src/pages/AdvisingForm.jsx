@@ -1,6 +1,6 @@
 import { useAdvising } from '../context/AdvisingContext';
 import { useFormState } from '../hooks/useFormState';
-import { submitAdvisingForm } from '../api/advising';
+import { submitAdvisingForm, submitManualCourses } from '../api/advising';
 import { useNavigate } from 'react-router-dom';
 import Sidebar from '../components/layout/Sidebar';
 import StudentInfoForm from '../components/form/StudentInfoForm';
@@ -20,31 +20,50 @@ export default function AdvisingFormPage() {
   const [submitting, setSubmitting] = useState(false);
 
   const StepComponent = stepComponents[step];
+  const isManualMode = state.inputMode === 'manual';
 
   const handleSubmit = async () => {
-    if (!state.uploadedFile) {
-      alert('Upload a transcript before generating your schedule.');
-      dispatch({ type: 'SET_STEP', payload: 1 });
-      return;
+    if (isManualMode) {
+      if (state.manualCourses.length === 0) {
+        alert('Add at least one course before generating your schedule.');
+        dispatch({ type: 'SET_STEP', payload: 1 });
+        return;
+      }
+    } else {
+      if (!state.uploadedFile) {
+        alert('Upload a transcript before generating your schedule.');
+        dispatch({ type: 'SET_STEP', payload: 1 });
+        return;
+      }
     }
 
     try {
       setSubmitting(true);
-      const result = await submitAdvisingForm({
-        student: state.studentInfo,
-        courses: state.courses,
-        goals: state.goals,
-        notes: state.advisorNotes,
-        transcriptFile: state.uploadedFile,
-        bearCardFile: state.bearCardFile,
-      });
+
+      let result;
+      if (isManualMode) {
+        result = await submitManualCourses({
+          student: state.studentInfo,
+          manualCourses: state.manualCourses,
+          courses: state.courses,
+          goals: state.goals,
+          notes: state.advisorNotes,
+        });
+      } else {
+        result = await submitAdvisingForm({
+          student: state.studentInfo,
+          courses: state.courses,
+          goals: state.goals,
+          notes: state.advisorNotes,
+          transcriptFile: state.uploadedFile,
+          bearCardFile: state.bearCardFile,
+        });
+      }
+
       dispatch({ type: 'SET_CONFIRMATION', payload: result.confirmation_id || null });
       dispatch({
         type: 'SET_TRANSCRIPT',
-        payload: {
-          id: result.transcript_id || null,
-          parsed: result.parsedCourses || [],
-        },
+        payload: { id: result.transcript_id || null, parsed: result.parsedCourses || [] },
       });
       dispatch({ type: 'SET_UPLOAD_RESULT', payload: result });
       navigate('/results');

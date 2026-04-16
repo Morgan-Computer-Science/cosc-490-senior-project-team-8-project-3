@@ -1,11 +1,57 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAdvising } from '../context/AdvisingContext';
+import AIChat from '../components/ai/AIChat';
+import { runAudit, runScheduleAgent } from '../api/advising';
 import '../styles/results.css';
 
 export default function Results() {
   const { state } = useAdvising();
   const navigate = useNavigate();
+  const [auditResult, setAuditResult] = useState(null);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditError, setAuditError] = useState('');
+  const [schedulePlan, setSchedulePlan] = useState(null);
+  const [scheduleLoading, setScheduleLoading] = useState(false);
+  const [scheduleError, setScheduleError] = useState('');
+
+  const handleRunAudit = async () => {
+    if (!uploadResult) return;
+    setAuditLoading(true);
+    setAuditError('');
+    try {
+      const res = await runAudit({
+        sessionId: state.confirmationId,
+        student: uploadResult.student,
+        validation: uploadResult.validation,
+      });
+      setAuditResult(res.audit);
+    } catch (err) {
+      setAuditError(err.message || 'Audit failed');
+    } finally {
+      setAuditLoading(false);
+    }
+  };
+
+  const handleRunScheduleAgent = async () => {
+    if (!uploadResult) return;
+    setScheduleLoading(true);
+    setScheduleError('');
+    try {
+      const res = await runScheduleAgent({
+        sessionId: state.confirmationId,
+        student: uploadResult.student,
+        validation: uploadResult.validation,
+        goals: uploadResult.goals,
+        requestedCourses: uploadResult.requestedCourses,
+      });
+      setSchedulePlan(res.plan);
+    } catch (err) {
+      setScheduleError(err.message || 'Schedule planning failed');
+    } finally {
+      setScheduleLoading(false);
+    }
+  };
 
   useEffect(() => {
     if (!state.uploadResult) {
@@ -401,9 +447,221 @@ export default function Results() {
 
           {/* File Information */}
           <div className="section file-info">
-            <h2>📄 Upload Information</h2>
+            <h2>Upload Information</h2>
             <p><strong>File:</strong> {uploadResult.fileName || 'Unknown'}</p>
             <p><strong>Transcript ID:</strong> {uploadResult.transcript_id || 'N/A'}</p>
+            {uploadResult.inputMode === 'manual' && (
+              <p style={{ color: 'var(--accent)', fontSize: '0.85rem', marginTop: '0.25rem' }}>
+                Submitted via manual course entry
+              </p>
+            )}
+          </div>
+
+          {/* ── Degree Audit Agent ── */}
+          <div className="section">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
+              <div>
+                <h2 style={{ margin: 0 }}>Degree Audit Agent</h2>
+                <p style={{ fontSize: '0.83rem', color: 'var(--muted)', margin: '0.25rem 0 0' }}>
+                  Run a systematic, requirement-by-requirement audit powered by AI tool use.
+                </p>
+              </div>
+              {!auditResult && (
+                <button
+                  className="btn btn-primary"
+                  onClick={handleRunAudit}
+                  disabled={auditLoading}
+                  style={{ whiteSpace: 'nowrap' }}
+                >
+                  {auditLoading ? 'Auditing...' : 'Run Full Audit'}
+                </button>
+              )}
+            </div>
+
+            {auditError && (
+              <div className="conflict-pill" style={{ marginTop: '1rem' }}>{auditError}</div>
+            )}
+
+            {auditResult && (
+              <div style={{ marginTop: '1.25rem' }}>
+                {/* Overall status */}
+                {auditResult.overall && (
+                  <div className="review-card" style={{ marginBottom: '1rem' }}>
+                    <div className="review-label" style={{
+                      color: auditResult.overall.overall_status === 'ON_TRACK' ? 'var(--accent)'
+                        : auditResult.overall.overall_status === 'AT_RISK' ? '#facc15' : '#f87171',
+                    }}>
+                      {auditResult.overall.overall_status?.replace(/_/g, ' ')}
+                    </div>
+                    <p style={{ fontSize: '0.9rem', lineHeight: '1.7', color: 'var(--muted)', marginTop: '0.25rem' }}>
+                      {auditResult.overall.summary}
+                    </p>
+                    {auditResult.overall.estimated_semesters > 0 && (
+                      <p style={{ fontSize: '0.85rem', color: 'var(--text)', marginTop: '0.25rem' }}>
+                        Estimated semesters remaining: <strong>{auditResult.overall.estimated_semesters}</strong>
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* Requirements */}
+                {auditResult.requirements?.length > 0 && (
+                  <div className="requirements-container">
+                    {auditResult.requirements.map((req, i) => (
+                      <div key={i} className="requirement-subsection">
+                        <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                          <span style={{
+                            fontSize: '0.7rem', fontWeight: 700, padding: '0.15rem 0.5rem',
+                            borderRadius: '4px', letterSpacing: '0.05em',
+                            background: req.status === 'SATISFIED' ? 'rgba(110,231,183,0.15)'
+                              : req.status === 'PARTIAL' ? 'rgba(250,204,21,0.15)' : 'rgba(248,113,113,0.15)',
+                            color: req.status === 'SATISFIED' ? 'var(--accent)'
+                              : req.status === 'PARTIAL' ? '#facc15' : '#f87171',
+                          }}>
+                            {req.status}
+                          </span>
+                          {req.category}
+                        </h3>
+                        {req.completed?.length > 0 && (
+                          <div style={{ marginTop: '0.4rem' }}>
+                            <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Completed: </span>
+                            <span style={{ fontSize: '0.8rem' }}>{req.completed.join(', ')}</span>
+                          </div>
+                        )}
+                        {req.missing?.length > 0 && (
+                          <div style={{ marginTop: '0.2rem' }}>
+                            <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Missing: </span>
+                            <span style={{ fontSize: '0.8rem', color: '#f87171' }}>{req.missing.join(', ')}</span>
+                          </div>
+                        )}
+                        {req.notes && (
+                          <p style={{ fontSize: '0.8rem', color: 'var(--muted)', marginTop: '0.4rem', lineHeight: 1.6 }}>
+                            {req.notes}
+                          </p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Risks */}
+                {auditResult.risks?.length > 0 && (
+                  <div style={{ marginTop: '1rem' }}>
+                    <h3>Graduation Risks</h3>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '0.5rem' }}>
+                      {auditResult.risks.map((risk, i) => (
+                        <div key={i} style={{
+                          padding: '0.75rem 1rem', borderRadius: '8px', lineHeight: 1.6,
+                          background: risk.severity === 'HIGH' ? 'rgba(248,113,113,0.1)'
+                            : risk.severity === 'MEDIUM' ? 'rgba(250,204,21,0.1)' : 'rgba(110,231,183,0.05)',
+                          borderLeft: `3px solid ${risk.severity === 'HIGH' ? '#f87171' : risk.severity === 'MEDIUM' ? '#facc15' : 'var(--accent)'}`,
+                        }}>
+                          <div style={{ fontWeight: 600, fontSize: '0.82rem', marginBottom: '0.25rem',
+                            color: risk.severity === 'HIGH' ? '#f87171' : risk.severity === 'MEDIUM' ? '#facc15' : 'var(--accent)',
+                          }}>
+                            {risk.severity} RISK
+                          </div>
+                          <div style={{ fontSize: '0.85rem' }}>{risk.description}</div>
+                          <div style={{ fontSize: '0.8rem', color: 'var(--muted)', marginTop: '0.25rem' }}>
+                            Action: {risk.action}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* ── Schedule Planning Agent ── */}
+          <div className="section">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
+              <div>
+                <h2 style={{ margin: 0 }}>Multi-Semester Schedule Plan</h2>
+                <p style={{ fontSize: '0.83rem', color: 'var(--muted)', margin: '0.25rem 0 0' }}>
+                  AI agent that plans your courses across multiple semesters with sequencing constraints.
+                </p>
+              </div>
+              {!schedulePlan && (
+                <button
+                  className="btn btn-primary"
+                  onClick={handleRunScheduleAgent}
+                  disabled={scheduleLoading}
+                  style={{ whiteSpace: 'nowrap' }}
+                >
+                  {scheduleLoading ? 'Planning...' : 'Plan My Schedule'}
+                </button>
+              )}
+            </div>
+
+            {scheduleError && (
+              <div className="conflict-pill" style={{ marginTop: '1rem' }}>{scheduleError}</div>
+            )}
+
+            {schedulePlan && (
+              <div style={{ marginTop: '1.25rem' }}>
+                {schedulePlan.summary && (
+                  <div className="review-card" style={{ marginBottom: '1rem' }}>
+                    <div className="review-label">Plan Summary</div>
+                    <p style={{ fontSize: '0.9rem', lineHeight: '1.7', color: 'var(--muted)', marginTop: '0.25rem' }}>
+                      {schedulePlan.summary.summary}
+                    </p>
+                    {schedulePlan.summary.semesters_to_graduation > 0 && (
+                      <p style={{ fontSize: '0.85rem', marginTop: '0.25rem' }}>
+                        Estimated semesters to graduation: <strong>{schedulePlan.summary.semesters_to_graduation}</strong>
+                      </p>
+                    )}
+                    {schedulePlan.summary.credit_load_warning && (
+                      <p style={{ fontSize: '0.8rem', color: '#facc15', marginTop: '0.25rem' }}>
+                        {schedulePlan.summary.credit_load_warning}
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* Group courses by semester */}
+                {schedulePlan.courses?.length > 0 && (() => {
+                  const bySemester = schedulePlan.courses.reduce((acc, c) => {
+                    const sem = c.semester || 'Unscheduled';
+                    if (!acc[sem]) acc[sem] = [];
+                    acc[sem].push(c);
+                    return acc;
+                  }, {});
+                  return Object.entries(bySemester).map(([sem, courses]) => (
+                    <div key={sem} style={{ marginBottom: '1rem' }}>
+                      <h3 style={{ fontSize: '0.9rem', color: 'var(--accent)', marginBottom: '0.5rem' }}>
+                        {sem}
+                      </h3>
+                      <div className="requirements-container">
+                        {courses.map((c, i) => (
+                          <div key={i} className="requirement-subsection">
+                            <h3>{c.code} — {c.name}</h3>
+                            <p style={{ fontSize: '0.82rem', color: 'var(--muted)', marginTop: '0.3rem', lineHeight: 1.6 }}>
+                              {c.reason}
+                              {c.credit_hours && ` · ${c.credit_hours} credits`}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ));
+                })()}
+
+                {schedulePlan.notes?.length > 0 && (
+                  <div style={{ marginTop: '0.75rem' }}>
+                    <h3 style={{ fontSize: '0.85rem' }}>Scheduling Notes</h3>
+                    <ul style={{ marginTop: '0.5rem', paddingLeft: '1.2rem', lineHeight: 1.8 }}>
+                      {schedulePlan.notes.map((n, i) => (
+                        <li key={i} style={{ fontSize: '0.82rem', color: 'var(--muted)' }}>
+                          <strong>{n.type}: </strong>{n.note}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </>
       )}
@@ -430,19 +688,31 @@ export default function Results() {
 
       {/* Navigation Buttons */}
       <div className="results-actions">
-        <button 
-          className="btn btn-secondary" 
+        <button
+          className="btn btn-secondary"
           onClick={() => navigate('/advising')}
         >
           ← Back to Form
         </button>
-        <button 
+        <button
+          className="btn btn-ghost"
+          onClick={() => {
+            const text = `BearAdvisor results for ${uploadResult?.student?.name || 'student'} — Session ${state.confirmationId || ''}`;
+            if (navigator.clipboard) navigator.clipboard.writeText(text);
+            alert('Session ID copied — share with your advisor: ' + (state.confirmationId || 'N/A'));
+          }}
+        >
+          Share with Advisor
+        </button>
+        <button
           className="btn btn-primary"
           onClick={() => navigate('/home')}
         >
           Home
         </button>
       </div>
+
+      <AIChat />
     </div>
   );
 }

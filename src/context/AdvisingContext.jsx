@@ -10,13 +10,16 @@ const initialState = {
   uploadedFile: null,
   transcriptId: null,
   parsedTranscript: null,
-  uploadResult: null, // full backend response after transcript upload
+  uploadResult: null,
   courses: [],
   goals: '',
   advisorNotes: '',
   aiSuggestions: [],
   aiLoading: false,
   confirmationId: null,
+  // New: manual course entry
+  inputMode: 'pdf', // 'pdf' | 'manual'
+  manualCourses: [],  // [{ code, status, grade, term }]
 };
 
 function advisingReducer(state, action) {
@@ -54,6 +57,17 @@ function advisingReducer(state, action) {
       return { ...state, aiLoading: action.payload };
     case 'SET_CONFIRMATION':
       return { ...state, confirmationId: action.payload };
+    case 'SET_INPUT_MODE':
+      return { ...state, inputMode: action.payload };
+    case 'ADD_MANUAL_COURSE': {
+      const code = String(action.payload.code || '').toUpperCase().replace(/\s/g, '');
+      if (!code || state.manualCourses.some(c => c.code === code)) return state;
+      return { ...state, manualCourses: [...state.manualCourses, { ...action.payload, code }] };
+    }
+    case 'REMOVE_MANUAL_COURSE':
+      return { ...state, manualCourses: state.manualCourses.filter(c => c.code !== action.payload) };
+    case 'CLEAR_MANUAL_COURSES':
+      return { ...state, manualCourses: [] };
     case 'RESET':
       return initialState;
     default:

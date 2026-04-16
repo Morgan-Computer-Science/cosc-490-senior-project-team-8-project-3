@@ -18,4 +18,10 @@ export const YEAR_OPTIONS = ['Freshman', 'Sophomore', 'Junior', 'Senior', 'Grad'
 
 export const ENDPOINTS = {
   submit: '/api/submit',
+  submitManual: '/api/submit-manual',
+  extractBearCard: '/api/bear-card/extract',
+  chat: '/api/chat',
+  audit: '/api/audit',
+  scheduleAgent: '/api/schedule-agent',
+  sessions: '/api/sessions',
 };

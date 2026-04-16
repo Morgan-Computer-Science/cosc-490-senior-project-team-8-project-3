@@ -8,6 +8,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { spawn } from 'child_process';
+import Anthropic from '@anthropic-ai/sdk';
+import pg from 'pg';
 import {
   ALLOWED_DEPARTMENT_PREFIXES,
   classifyCourse,
@@ -50,6 +52,26 @@ function loadLocalEnv() {
 }
 
 loadLocalEnv();
+
+// Anthropic client (used for chat, OCR, audit agent, schedule agent)
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
+
+if (!anthropic) console.warn('ANTHROPIC_API_KEY not set — chat, OCR, and agent features disabled');
+
+// DB pool (optional — gracefully falls back when Docker DB is not running)
+const { Pool } = pg;
+let db = null;
+try {
+  db = new Pool({ connectionString: process.env.DATABASE_URL });
+  db.on('error', (err) => console.error('DB pool error:', err.message));
+} catch (e) {
+  console.warn('DB unavailable:', e.message);
+}
+
+// In-memory chat sessions: sessionId → { messages, context }
+const chatSessions = new Map();
 
 // Middleware
 app.use(cors());
@@ -817,6 +839,306 @@ function groupClassifiedCourses(classifiedCourses) {
   return grouped;
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Agentic helpers
+// ─────────────────────────────────────────────────────────────────────
+
+function buildChatSystemPrompt(context) {
+  const { student, validation, recommendedSchedule } = context || {};
+  const completed = [
+    ...(validation?.completedCoreRequirements || []),
+    ...(validation?.completedMathRequirements || []),
+  ];
+  const missing = [
+    ...(validation?.missingCoreRequirements || []),
+    ...(validation?.missingMathRequirements || []),
+  ];
+
+  return [
+    'You are BearAdvisor, an AI academic advisor for Morgan State University Computer Science B.S. students.',
+    'You are speaking with a student about their specific degree progress. Be concise, specific, and encouraging.',
+    'Use the transcript data below to answer questions precisely. Do not guess if data is missing.',
+    '',
+    student?.name ? `Student: ${student.name}${student.year ? `, ${student.year}` : ''}` : '',
+    completed.length
+      ? `Completed core/math courses: ${completed.join(', ')}`
+      : 'No core or math courses completed yet.',
+    missing.length
+      ? `Still missing required courses: ${missing.join(', ')}`
+      : 'All core and math requirements are satisfied.',
+    validation?.unknownCourses?.length
+      ? `Unclassified transcript entries needing review: ${validation.unknownCourses.join(', ')}`
+      : '',
+    recommendedSchedule?.length
+      ? `Currently recommended next courses: ${recommendedSchedule.map((c) => `${c.code} (${c.name || c.code})`).join(', ')}`
+      : '',
+    '',
+    'CS B.S. requirements: 12 core COSC courses, 4 math courses (MATH241/242/312/331), gen ed, and CS electives.',
+    'Keep responses under 200 words unless the question genuinely requires more detail.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+async function runAuditAgent({ student, validation }) {
+  if (!anthropic) throw new Error('Anthropic API not configured');
+
+  const tools = [
+    {
+      name: 'record_requirement',
+      description: 'Record the audit status of one degree requirement category',
+      input_schema: {
+        type: 'object',
+        properties: {
+          category: { type: 'string', description: 'e.g. "Core CS", "Mathematics", "General Education"' },
+          status: { type: 'string', enum: ['SATISFIED', 'PARTIAL', 'MISSING'] },
+          completed: { type: 'array', items: { type: 'string' } },
+          missing: { type: 'array', items: { type: 'string' } },
+          notes: { type: 'string' },
+        },
+        required: ['category', 'status', 'completed', 'missing', 'notes'],
+      },
+    },
+    {
+      name: 'add_risk',
+      description: 'Flag a graduation risk',
+      input_schema: {
+        type: 'object',
+        properties: {
+          severity: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'] },
+          description: { type: 'string' },
+          action: { type: 'string' },
+        },
+        required: ['severity', 'description', 'action'],
+      },
+    },
+    {
+      name: 'finalize_audit',
+      description: 'Complete the audit with overall assessment',
+      input_schema: {
+        type: 'object',
+        properties: {
+          overall_status: {
+            type: 'string',
+            enum: ['ON_TRACK', 'AT_RISK', 'NEEDS_IMMEDIATE_ATTENTION'],
+          },
+          estimated_semesters: { type: 'number' },
+          summary: { type: 'string' },
+        },
+        required: ['overall_status', 'estimated_semesters', 'summary'],
+      },
+    },
+  ];
+
+  const auditResult = { requirements: [], risks: [], overall: null };
+
+  const messages = [
+    {
+      role: 'user',
+      content: `Audit this Morgan State CS B.S. student's degree progress.
+
+Student: ${JSON.stringify(student || {})}
+Completed core CS (${(validation?.completedCoreRequirements || []).length}/12): ${JSON.stringify(validation?.completedCoreRequirements || [])}
+Missing core CS: ${JSON.stringify(validation?.missingCoreRequirements || [])}
+Completed math (${(validation?.completedMathRequirements || []).length}/4): ${JSON.stringify(validation?.completedMathRequirements || [])}
+Missing math: ${JSON.stringify(validation?.missingMathRequirements || [])}
+Supporting completed: ${JSON.stringify(validation?.completedSupportingRequirements || [])}
+Gen Ed completed: ${JSON.stringify(validation?.completedGenEdRequirements || [])}
+Gen Ed electives: ${JSON.stringify(validation?.completedGenEdElectives || [])}
+Unclassified: ${JSON.stringify(validation?.unknownCourses || [])}
+
+Call record_requirement for each category (Core CS, Mathematics, General Education, Electives, Supporting).
+Call add_risk for any graduation risks you identify.
+Finish with finalize_audit.`,
+    },
+  ];
+
+  for (let i = 0; i < 10; i++) {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 2048,
+      system: 'You are a precise degree audit agent. Systematically audit each requirement category using the tools.',
+      tools,
+      messages,
+    });
+
+    messages.push({ role: 'assistant', content: response.content });
+
+    const toolUses = response.content.filter((b) => b.type === 'tool_use');
+    if (toolUses.length === 0 || response.stop_reason === 'end_turn') break;
+
+    const results = [];
+    let done = false;
+
+    for (const tu of toolUses) {
+      if (tu.name === 'record_requirement') {
+        auditResult.requirements.push(tu.input);
+        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Recorded.' });
+      } else if (tu.name === 'add_risk') {
+        auditResult.risks.push(tu.input);
+        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Recorded.' });
+      } else if (tu.name === 'finalize_audit') {
+        auditResult.overall = tu.input;
+        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Audit finalized.' });
+        done = true;
+      }
+    }
+
+    messages.push({ role: 'user', content: results });
+    if (done) break;
+  }
+
+  return auditResult;
+}
+
+async function runScheduleAgent({ student, validation, reference, goals, requestedCourses }) {
+  if (!anthropic) throw new Error('Anthropic API not configured');
+
+  const protectedCodes = new Set(
+    (validation?.completedOrProtectedCourses || []).map(normalizeCourseCode)
+  );
+  const candidates = (validation?.recommendationCandidates || []).filter(
+    (c) => !protectedCodes.has(normalizeCourseCode(c.code))
+  );
+
+  const tools = [
+    {
+      name: 'add_course_to_plan',
+      description: 'Add a course to the multi-semester plan',
+      input_schema: {
+        type: 'object',
+        properties: {
+          code: { type: 'string' },
+          name: { type: 'string' },
+          semester: { type: 'string', description: 'e.g. "Fall 2026"' },
+          reason: { type: 'string' },
+          priority: { type: 'number' },
+          credit_hours: { type: 'number' },
+        },
+        required: ['code', 'name', 'semester', 'reason', 'priority'],
+      },
+    },
+    {
+      name: 'add_planning_note',
+      description: 'Add a scheduling note or constraint',
+      input_schema: {
+        type: 'object',
+        properties: {
+          note: { type: 'string' },
+          type: {
+            type: 'string',
+            enum: ['PREREQUISITE', 'SEQUENCING', 'WORKLOAD', 'GOAL_ALIGNMENT'],
+          },
+        },
+        required: ['note', 'type'],
+      },
+    },
+    {
+      name: 'finalize_plan',
+      description: 'Complete the plan with summary',
+      input_schema: {
+        type: 'object',
+        properties: {
+          semesters_to_graduation: { type: 'number' },
+          summary: { type: 'string' },
+          credit_load_warning: { type: 'string' },
+        },
+        required: ['semesters_to_graduation', 'summary'],
+      },
+    },
+  ];
+
+  const planResult = { courses: [], notes: [], summary: null };
+
+  const messages = [
+    {
+      role: 'user',
+      content: `Create an optimized multi-semester course plan for this Morgan State CS B.S. student.
+
+Student: ${JSON.stringify({ ...(student || {}), goals: goals || 'Not specified' })}
+Already completed/protected: ${JSON.stringify([...protectedCodes])}
+Available to schedule: ${JSON.stringify(candidates)}
+Requested by student: ${JSON.stringify((requestedCourses || []).map(normalizeCourseCode))}
+
+Key constraints:
+- MATH241 → MATH242 (Calc I before Calc II)
+- COSC111 → COSC112 (intro sequence)
+- COSC490 (Capstone I) and COSC459 (Capstone II) need senior standing
+- Recommend at most 5 courses per semester for a reasonable workload
+
+Use add_course_to_plan for each recommended course (up to 8 courses across next 2-3 semesters).
+Use add_planning_note for key sequencing constraints.
+Finish with finalize_plan.`,
+    },
+  ];
+
+  for (let i = 0; i < 10; i++) {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 2048,
+      system: 'You are a course scheduling agent. Create an optimal multi-semester plan using the provided tools.',
+      tools,
+      messages,
+    });
+
+    messages.push({ role: 'assistant', content: response.content });
+
+    const toolUses = response.content.filter((b) => b.type === 'tool_use');
+    if (toolUses.length === 0 || response.stop_reason === 'end_turn') break;
+
+    const results = [];
+    let done = false;
+
+    for (const tu of toolUses) {
+      if (tu.name === 'add_course_to_plan') {
+        planResult.courses.push(tu.input);
+        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Added.' });
+      } else if (tu.name === 'add_planning_note') {
+        planResult.notes.push(tu.input);
+        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Noted.' });
+      } else if (tu.name === 'finalize_plan') {
+        planResult.summary = tu.input;
+        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Plan finalized.' });
+        done = true;
+      }
+    }
+
+    messages.push({ role: 'user', content: results });
+    if (done) break;
+  }
+
+  planResult.courses.sort((a, b) => (a.priority || 0) - (b.priority || 0));
+  return planResult;
+}
+
+async function persistSession({ student, confirmationId, classifiedCourses, validationSummary }) {
+  if (!db) return null;
+  try {
+    const studentRes = await db.query(
+      `INSERT INTO students (student_id, name, major)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (student_id) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id`,
+      [
+        student?.netid || confirmationId,
+        student?.name || 'Unknown',
+        student?.major || 'Computer Science B.S.',
+      ]
+    );
+    const studentDbId = studentRes.rows[0].id;
+
+    const sessionRes = await db.query(
+      `INSERT INTO sessions (student_id, summary) VALUES ($1, $2) RETURNING id`,
+      [studentDbId, JSON.stringify(validationSummary)]
+    );
+
+    return sessionRes.rows[0].id;
+  } catch (err) {
+    console.error('DB persist error:', err.message);
+    return null;
+  }
+}
+
 /**
  * POST /api/upload-transcript
  * Upload and validate transcript
@@ -986,6 +1308,17 @@ app.post('/api/submit', upload.fields([
     const transcriptId = `transcript_${Date.now()}`;
     const confirmationId = `confirmation_${Date.now()}`;
 
+    await persistSession({
+      student,
+      confirmationId,
+      classifiedCourses,
+      validationSummary: {
+        status: validationResult.status,
+        completedCore: validationResult.completedCoreRequirements,
+        completedMath: validationResult.completedMathRequirements,
+      },
+    });
+
     res.json({
       success: true,
       confirmation_id: confirmationId,
@@ -1102,6 +1435,337 @@ app.get('/api/courses/reference', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────
+// Agentic & ingestion routes
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/bear-card/extract
+ * Use Anthropic vision to extract student name + ID from Bear Card image.
+ */
+app.post('/api/bear-card/extract', upload.single('bearCard'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+  if (!anthropic) return res.status(503).json({ error: 'Anthropic API not configured' });
+
+  const supportedTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
+  if (!supportedTypes.has(req.file.mimetype)) {
+    return res.json({ name: '', student_id: '', note: 'HEIC not supported for OCR — enter info manually.' });
+  }
+
+  try {
+    const imageBuffer = fs.readFileSync(req.file.path);
+    const base64 = imageBuffer.toString('base64');
+
+    const result = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 256,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              source: { type: 'base64', media_type: req.file.mimetype, data: base64 },
+            },
+            {
+              type: 'text',
+              text: "This is a Morgan State University Bear Card (student ID card). Extract the student's full name and student ID number. Return ONLY valid JSON with no markdown: {\"name\": \"First Last\", \"student_id\": \"123456789\"}. If you cannot read the card, return {\"name\": \"\", \"student_id\": \"\"}.",
+            },
+          ],
+        },
+      ],
+    });
+
+    const text = result.content[0]?.text || '';
+    const parsed = extractJsonObject(text);
+
+    res.json({
+      name: String(parsed?.name || '').trim(),
+      student_id: String(parsed?.student_id || '').trim(),
+    });
+  } catch (err) {
+    console.error('Bear Card OCR error:', err.message);
+    res.status(500).json({ error: 'Failed to extract Bear Card info' });
+  } finally {
+    if (req.file?.path) setTimeout(() => fs.unlink(req.file.path, () => {}), 1000);
+  }
+});
+
+/**
+ * POST /api/chat
+ * Anthropic streaming chat with per-session transcript context.
+ * Responds with text/event-stream (SSE).
+ */
+app.post('/api/chat', async (req, res) => {
+  if (!anthropic) return res.status(503).json({ error: 'Anthropic API not configured' });
+
+  const { sessionId, message, context } = req.body || {};
+  if (!sessionId || !message?.trim()) {
+    return res.status(400).json({ error: 'sessionId and message are required' });
+  }
+
+  if (!chatSessions.has(sessionId)) {
+    chatSessions.set(sessionId, { messages: [], context: {} });
+  }
+  const session = chatSessions.get(sessionId);
+  if (context) Object.assign(session.context, context);
+
+  session.messages.push({ role: 'user', content: message.trim() });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  try {
+    let fullResponse = '';
+
+    const stream = anthropic.messages.stream({
+      model: 'claude-opus-4-6',
+      max_tokens: 1024,
+      system: buildChatSystemPrompt(session.context),
+      messages: session.messages.slice(-20),
+    });
+
+    stream.on('text', (text) => {
+      fullResponse += text;
+      res.write(`data: ${JSON.stringify({ text })}\n\n`);
+    });
+
+    await stream.finalMessage();
+
+    session.messages.push({ role: 'assistant', content: fullResponse });
+
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+  } catch (err) {
+    console.error('Chat stream error:', err.message);
+    res.write(`data: ${JSON.stringify({ error: 'Chat failed. Please try again.' })}\n\n`);
+    res.end();
+  }
+});
+
+/**
+ * POST /api/audit
+ * Degree audit agent using Anthropic tool use.
+ */
+app.post('/api/audit', async (req, res) => {
+  if (!anthropic) return res.status(503).json({ error: 'Anthropic API not configured' });
+
+  const { sessionId, student, validation } = req.body || {};
+  if (!validation) return res.status(400).json({ error: 'validation data required' });
+
+  try {
+    const audit = await runAuditAgent({ student, validation });
+    res.json({ success: true, audit, sessionId });
+  } catch (err) {
+    console.error('Audit agent error:', err.message);
+    res.status(500).json({ error: err.message || 'Audit failed' });
+  }
+});
+
+/**
+ * POST /api/schedule-agent
+ * Multi-semester schedule planning agent using Anthropic tool use.
+ */
+app.post('/api/schedule-agent', async (req, res) => {
+  if (!anthropic) return res.status(503).json({ error: 'Anthropic API not configured' });
+
+  const { sessionId, student, validation, goals, requestedCourses } = req.body || {};
+  if (!validation) return res.status(400).json({ error: 'validation data required' });
+
+  try {
+    const reference = await getCourseReferenceData();
+    const plan = await runScheduleAgent({ student, validation, reference, goals, requestedCourses });
+    res.json({ success: true, plan, sessionId });
+  } catch (err) {
+    console.error('Schedule agent error:', err.message);
+    res.status(500).json({ error: err.message || 'Schedule planning failed' });
+  }
+});
+
+/**
+ * GET /api/sessions/:netid
+ * Return past advising sessions for a student (requires DB).
+ */
+app.get('/api/sessions/:netid', async (req, res) => {
+  if (!db) return res.json({ sessions: [], note: 'DB not available' });
+
+  try {
+    const studentRes = await db.query(
+      'SELECT id FROM students WHERE student_id = $1',
+      [req.params.netid]
+    );
+    if (studentRes.rows.length === 0) return res.json({ sessions: [] });
+
+    const sessionRes = await db.query(
+      'SELECT id, started_at, summary FROM sessions WHERE student_id = $1 ORDER BY started_at DESC LIMIT 10',
+      [studentRes.rows[0].id]
+    );
+
+    res.json({
+      sessions: sessionRes.rows.map((row) => ({
+        id: row.id,
+        date: row.started_at,
+        summary: safeParseJson(row.summary, {}),
+      })),
+    });
+  } catch (err) {
+    console.error('Sessions fetch error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/submit-manual
+ * Accept a manually entered list of courses, run the same analysis as /api/submit.
+ */
+app.post('/api/submit-manual', async (req, res) => {
+  const { student, manualCourses, courses: requestedCourses, goals, notes } = req.body || {};
+
+  if (!Array.isArray(manualCourses) || manualCourses.length === 0) {
+    return res.status(400).json({ error: 'manualCourses array is required' });
+  }
+
+  try {
+    const reference = await getCourseReferenceData();
+
+    // Build a degreeWorksMatches map from the user-entered course list
+    const degreeWorksMatches = new Map();
+    for (const entry of manualCourses) {
+      const code = normalizeSeedCourseCode(String(entry.code || ''));
+      if (!code || isTranscriptTermMarker(code)) continue;
+      degreeWorksMatches.set(code, {
+        status: entry.status || 'COMPLETED',
+        grade: entry.grade || '',
+        term: entry.term || '',
+        credits: entry.credits ?? null,
+        confidence: 1,
+        isValidCourse: true,
+      });
+    }
+
+    const requirementOptionMatches = new Map();
+    const courseUniverse = [...degreeWorksMatches.keys()];
+
+    const classifiedCourses = courseUniverse.map((code) =>
+      classifyCourse(code, null, { degreeWorksMatches, requirementOptionMatches })
+    );
+
+    const recommendationState = buildRecommendationState({
+      classifiedCourses,
+      requirementOptionMatches,
+      reference,
+    });
+
+    const groupedClassifications = groupClassifiedCourses(classifiedCourses);
+    const unclassifiedCourses = classifiedCourses
+      .filter((c) => c.status === 'UNCLASSIFIED' || c.category === 'UNKNOWN')
+      .map((c) => c.normalizedCourseCode);
+
+    const coreCodes = Object.keys(reference?.core_cs_courses || {}).map(normalizeCourseCode);
+    const mathCodes = Object.keys(reference?.math_requirements || {}).map(normalizeCourseCode);
+    const completedCore = groupedClassifications.CS_CORE;
+    const completedMath = groupedClassifications.MATH_REQUIRED;
+
+    const validationResult = {
+      totalFound: courseUniverse.length,
+      validCount: courseUniverse.length - unclassifiedCourses.length,
+      invalidCount: unclassifiedCourses.length,
+      validationRate:
+        courseUniverse.length > 0
+          ? ((courseUniverse.length - unclassifiedCourses.length) / courseUniverse.length) * 100
+          : 0,
+      foundCourses: courseUniverse,
+      unknownCourses: unclassifiedCourses,
+      coursesByCategory: {
+        core: completedCore,
+        electives: groupedClassifications.FREE_ELECTIVE,
+        math: completedMath,
+        cloud: [],
+        genEd: [
+          ...groupedClassifications.GEN_ED_REQUIRED,
+          ...groupedClassifications.GEN_ED_ELECTIVE,
+        ],
+      },
+      completedCoreRequirements: completedCore,
+      missingCoreRequirements: coreCodes.filter((c) => !completedCore.includes(c)),
+      completedMathRequirements: completedMath,
+      missingMathRequirements: mathCodes.filter((c) => !completedMath.includes(c)),
+      completedSupportingRequirements: groupedClassifications.SUPPORTING_REQUIRED,
+      completedGenEdRequirements: groupedClassifications.GEN_ED_REQUIRED,
+      completedGenEdElectives: groupedClassifications.GEN_ED_ELECTIVE,
+      completedFreeElectives: groupedClassifications.FREE_ELECTIVE,
+      completedOrProtectedCourses: recommendationState.completedOrProtectedCourses,
+      availableOptions: recommendationState.availableOptions,
+      recommendationCandidates: recommendationState.recommendationCandidates,
+      termMarkers: [],
+      status: 'INCOMPLETE',
+    };
+
+    if (
+      validationResult.missingCoreRequirements.length === 0 &&
+      validationResult.missingMathRequirements.length === 0 &&
+      unclassifiedCourses.length === 0
+    ) {
+      validationResult.status = 'COMPLETE';
+    } else if (unclassifiedCourses.length > 0) {
+      validationResult.status = 'INVALID_COURSES_FOUND';
+    }
+
+    let recommendedSchedule = buildFallbackSchedule({ reference, requestedCourses, validation: validationResult });
+    let aiSummary = buildFallbackSummary({ studentInfo: student, goals, requestedCourses, validation: validationResult });
+
+    try {
+      aiSummary = await fetchVertexTranscriptSummary({ studentInfo: student, requestedCourses, goals, validation: validationResult, reference });
+    } catch (e) {
+      console.error('Vertex summary error (manual):', e.message);
+    }
+
+    try {
+      const vertexSchedule = await fetchVertexSchedulePlan({ studentInfo: student, requestedCourses, goals, validation: validationResult, reference });
+      if (vertexSchedule.length > 0) recommendedSchedule = vertexSchedule;
+    } catch (e) {
+      console.error('Vertex schedule error (manual):', e.message);
+    }
+
+    const confirmationId = `confirmation_${Date.now()}`;
+    const transcriptId = `manual_${Date.now()}`;
+
+    await persistSession({
+      student,
+      confirmationId,
+      classifiedCourses,
+      validationSummary: { status: validationResult.status, completedCore, completedMath },
+    });
+
+    res.json({
+      success: true,
+      confirmation_id: confirmationId,
+      transcript_id: transcriptId,
+      fileName: 'Manual Entry',
+      student,
+      requestedCourses,
+      goals,
+      notes,
+      validation: validationResult,
+      termMarkers: [],
+      parsedDegreeWorksRows: [],
+      classifiedCourses,
+      availableOptions: recommendationState.availableOptions,
+      aiSummary,
+      recommendedSchedule,
+      extractedCourses: validationResult.validCount,
+      parsedCourses: [...completedCore, ...completedMath],
+      bearCardUploaded: false,
+      inputMode: 'manual',
+    });
+  } catch (err) {
+    console.error('Manual submit error:', err.message);
+    res.status(500).json({ error: err.message || 'Manual submission failed' });
+  }
+});
+
 // Error handling middleware
 app.use((err, req, res, _next) => {
   console.error(err.stack);
@@ -1117,3 +1781,4 @@ app.listen(PORT, HOST, () => {
   console.log(`📝 Transcript upload endpoint: POST /api/upload-transcript`);
   console.log(`✅ Health check: GET /api/health`);
 });
+// patched at bottom — override extractPdfText to use pdf-parser service
