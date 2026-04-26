@@ -10,8 +10,15 @@ Run this from the project root:
 
 That installs:
 - Node packages from `package.json`
+- a project-local Python environment in `.venv`
 - Python packages from `requirements.txt`
 - everything needed to run the website locally
+
+You can also rebuild only the Python environment with:
+
+```bash
+npm run setup:venv
+```
 
 ## Start The Website
 
@@ -33,6 +40,8 @@ calebbanks@local cosc-490-senior-project-team-8-project-3 % npm run dev:all
 - `npm run dev` starts the Vite frontend on port `3000`
 - `npm run server` starts the Express backend on port `3001`
 - `npm run dev:all` starts both together
+- `npm run agent -- record --output ./.agent-output/prompt.wav` records a voice prompt using the project `.venv`
+- `npm run agent -- transcribe --audio ./.agent-output/prompt.wav` transcribes that recording through the backend
 
 ## If The App Crashes
 

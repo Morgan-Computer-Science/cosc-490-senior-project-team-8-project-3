@@ -7,7 +7,9 @@
     "dev": "vite",
     "server": "node server.js",
     "dev:all": "concurrently \"npm run dev\" \"npm run server\"",
-    "setup:deps": "npm install && python3 -m pip install -r requirements.txt",
+    "agent": "node scripts/vertex-agent.js",
+    "setup:venv": "bash scripts/setup-venv.sh",
+    "setup:deps": "npm install && npm run setup:venv",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview"

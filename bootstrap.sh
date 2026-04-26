@@ -13,7 +13,7 @@ echo "Installing Node dependencies..."
 npm install
 
 echo "Installing Python dependencies..."
-python3 -m pip install -r requirements.txt
+npm run setup:venv
 
 echo
 echo "Bootstrap complete."

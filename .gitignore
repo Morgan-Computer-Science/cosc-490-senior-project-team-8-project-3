@@ -10,8 +10,12 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+.venv
 *.local
 .env
+*-*.json
+!package-lock.json
+!shared/*.json
 
 # Editor directories and files
 .vscode/*

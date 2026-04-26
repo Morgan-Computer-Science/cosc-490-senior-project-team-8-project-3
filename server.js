@@ -7,8 +7,8 @@ import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import crypto from 'crypto';
 import { spawn } from 'child_process';
-import Anthropic from '@anthropic-ai/sdk';
 import pg from 'pg';
 import {
   ALLOWED_DEPARTMENT_PREFIXES,
@@ -26,7 +26,11 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = process.env.PORT || 3001;
-const DEFAULT_VERTEX_MODEL = process.env.VERTEX_MODEL || 'gemini-2.5-flash';
+const PYTHON_BIN = process.env.PYTHON_BIN || (
+  fs.existsSync(path.join(__dirname, '.venv', 'bin', 'python'))
+    ? path.join(__dirname, '.venv', 'bin', 'python')
+    : 'python3'
+);
 
 let courseReferenceCache = null;
 
@@ -53,19 +57,30 @@ function loadLocalEnv() {
 
 loadLocalEnv();
 
-// Anthropic client (used for chat, OCR, audit agent, schedule agent)
-const anthropic = process.env.ANTHROPIC_API_KEY
-  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-  : null;
+const DEFAULT_VERTEX_MODEL = process.env.VERTEX_MODEL || 'gemini-2.5-flash';
+const VERTEX_API_KEY = process.env.VERTEX_API_KEY || process.env.GOOGLE_API_KEY || '';
+const GOOGLE_APPLICATION_CREDENTIALS = process.env.GOOGLE_APPLICATION_CREDENTIALS || '';
+const GOOGLE_ACCESS_TOKEN = process.env.GOOGLE_ACCESS_TOKEN || '';
+const GOOGLE_CLOUD_PROJECT = process.env.GOOGLE_CLOUD_PROJECT || '';
+const VERTEX_LOCATION = process.env.VERTEX_LOCATION || 'us-central1';
+const VERTEX_ENABLE_SEARCH_GROUNDING = String(process.env.VERTEX_ENABLE_SEARCH_GROUNDING || '').toLowerCase() === 'true';
 
-if (!anthropic) console.warn('ANTHROPIC_API_KEY not set — chat, OCR, and agent features disabled');
+if (!VERTEX_API_KEY) console.warn('VERTEX_API_KEY not set — AI features disabled');
+if (!GOOGLE_APPLICATION_CREDENTIALS && !GOOGLE_ACCESS_TOKEN) {
+  console.warn('GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_ACCESS_TOKEN not set — Google voice features disabled');
+}
 
 // DB pool (optional — gracefully falls back when Docker DB is not running)
 const { Pool } = pg;
 let db = null;
 try {
-  db = new Pool({ connectionString: process.env.DATABASE_URL });
-  db.on('error', (err) => console.error('DB pool error:', err.message));
+  const databaseUrl = String(process.env.DATABASE_URL || '').trim();
+  if (databaseUrl && !databaseUrl.includes('your_postgres_connection_string_here')) {
+    db = new Pool({ connectionString: databaseUrl });
+    db.on('error', (err) => console.error('DB pool error:', err.message));
+  } else if (databaseUrl) {
+    console.warn('DATABASE_URL is still a placeholder — DB persistence disabled');
+  }
 } catch (e) {
   console.warn('DB unavailable:', e.message);
 }
@@ -100,14 +115,31 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     const isTranscript = file.fieldname === 'transcript';
     const isBearCard = file.fieldname === 'bearCard';
+    const isAudio = file.fieldname === 'audio';
     const allowedBearCardTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic']);
+    const allowedAudioTypes = new Set([
+      'audio/mpeg',
+      'audio/mp3',
+      'audio/wav',
+      'audio/wave',
+      'audio/x-wav',
+      'audio/webm',
+      'audio/ogg',
+      'audio/flac',
+    ]);
 
     if (isTranscript && file.mimetype === 'application/pdf') {
       cb(null, true);
     } else if (isBearCard && allowedBearCardTypes.has(file.mimetype)) {
       cb(null, true);
+    } else if (isAudio && allowedAudioTypes.has(file.mimetype)) {
+      cb(null, true);
     } else {
-      cb(new Error(isBearCard ? 'Only JPG, PNG, WebP, or HEIC images are allowed for Bear Card uploads' : 'Only PDF files are allowed for transcripts'));
+      cb(new Error(isBearCard
+        ? 'Only JPG, PNG, WebP, or HEIC images are allowed for Bear Card uploads'
+        : isAudio
+          ? 'Only MP3, WAV, WebM, OGG, or FLAC audio files are allowed'
+          : 'Only PDF files are allowed for transcripts'));
     }
   }
 });
@@ -117,8 +149,7 @@ const upload = multer({
  */
 function runPythonValidation(pdfPath) {
   return new Promise((resolve, reject) => {
-    // Call Python script: python3 test_transcript.py <pdf_path>
-    const pythonProcess = spawn('python3', ['test_transcript.py', pdfPath]);
+    const pythonProcess = spawn(PYTHON_BIN, ['test_transcript.py', pdfPath]);
 
     let stdout = '';
     let stderr = '';
@@ -149,7 +180,7 @@ function runPythonValidation(pdfPath) {
 
 function extractPdfText(pdfPath) {
   return new Promise((resolve, reject) => {
-    const pythonProcess = spawn('python3', ['-c', `
+    const pythonProcess = spawn(PYTHON_BIN, ['-c', `
 import sys
 import fitz
 
@@ -213,7 +244,7 @@ async function getCourseReferenceData() {
   if (courseReferenceCache) return courseReferenceCache;
 
   const courseReference = await new Promise((resolve, reject) => {
-    const pythonProcess = spawn('python3', ['-c', `
+    const pythonProcess = spawn(PYTHON_BIN, ['-c', `
 import sys
 sys.path.insert(0, '.')
 from course_reference import COURSE_REFERENCE
@@ -401,33 +432,184 @@ function buildFallbackSummary({ studentInfo, goals, requestedCourses, validation
   };
 }
 
-async function callVertexModel({ systemInstruction, prompt, temperature = 0.2 }) {
-  const apiKey = process.env.VERTEX_API_KEY;
-  if (!apiKey) {
+function extractVertexText(data) {
+  return data?.candidates?.[0]?.content?.parts?.map((part) => part?.text || '').join('').trim() || '';
+}
+
+function extractGroundingSources(data) {
+  const chunks = data?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+  return chunks
+    .map((chunk) => chunk.web)
+    .filter((web) => web?.uri)
+    .map((web) => ({
+      title: String(web.title || web.uri).trim(),
+      uri: String(web.uri).trim(),
+    }))
+    .filter((source, index, sources) => sources.findIndex((item) => item.uri === source.uri) === index)
+    .slice(0, 4);
+}
+
+function appendSources(text, sources) {
+  if (!Array.isArray(sources) || sources.length === 0) return text;
+  const sourceLines = sources.slice(0, 2).map((source, index) => `${index + 1}. ${source.title}: ${source.uri}`);
+  return `${text}\n\nSources:\n${sourceLines.join('\n')}`;
+}
+
+let googleTokenCache = null;
+let googleCredentialsCache = null;
+
+function base64UrlEncode(value) {
+  return Buffer.from(value)
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+async function getGoogleAccessToken() {
+  if (GOOGLE_ACCESS_TOKEN) return GOOGLE_ACCESS_TOKEN;
+  if (googleTokenCache && googleTokenCache.expiresAt > Date.now() + 60000) {
+    return googleTokenCache.accessToken;
+  }
+  if (!GOOGLE_APPLICATION_CREDENTIALS) {
+    throw new Error('Missing GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_ACCESS_TOKEN');
+  }
+
+  const credentials = getGoogleCredentials();
+  if (!credentials.client_email || !credentials.private_key) {
+    throw new Error('GOOGLE_APPLICATION_CREDENTIALS must point to a service account JSON key');
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const claim = {
+    iss: credentials.client_email,
+    scope: 'https://www.googleapis.com/auth/cloud-platform',
+    aud: credentials.token_uri || 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now,
+  };
+  const unsignedJwt = `${base64UrlEncode(JSON.stringify(header))}.${base64UrlEncode(JSON.stringify(claim))}`;
+  const signature = crypto
+    .createSign('RSA-SHA256')
+    .update(unsignedJwt)
+    .sign(credentials.private_key, 'base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+  const assertion = `${unsignedJwt}.${signature}`;
+
+  const response = await fetch(credentials.token_uri || 'https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion,
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.error_description || data?.error || 'Failed to get Google OAuth access token');
+  }
+
+  googleTokenCache = {
+    accessToken: data.access_token,
+    expiresAt: Date.now() + ((Number(data.expires_in) || 3600) * 1000),
+  };
+  return googleTokenCache.accessToken;
+}
+
+function getGoogleCredentials() {
+  if (googleCredentialsCache) return googleCredentialsCache;
+  if (!GOOGLE_APPLICATION_CREDENTIALS) return null;
+
+  const credentialsPath = path.resolve(__dirname, GOOGLE_APPLICATION_CREDENTIALS);
+  googleCredentialsCache = JSON.parse(fs.readFileSync(credentialsPath, 'utf8'));
+  return googleCredentialsCache;
+}
+
+function getVertexProjectId() {
+  return GOOGLE_CLOUD_PROJECT || getGoogleCredentials()?.project_id || '';
+}
+
+async function postGoogleJson(url, body, serviceName) {
+  const accessToken = await getGoogleAccessToken();
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data?.error?.message || `${serviceName} request failed`;
+    throw new Error(`${serviceName} error: ${message}`);
+  }
+
+  return data;
+}
+
+async function callVertexModel({
+  systemInstruction,
+  prompt,
+  contents,
+  temperature = 0.2,
+  responseMimeType = 'application/json',
+  useSearchGrounding = false,
+  maxOutputTokens,
+}) {
+  if (!VERTEX_API_KEY && !useSearchGrounding) {
     throw new Error('Missing VERTEX_API_KEY');
   }
 
-  const response = await fetch(`https://aiplatform.googleapis.com/v1/publishers/google/models/${DEFAULT_VERTEX_MODEL}:generateContent`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': apiKey,
-    },
-    body: JSON.stringify({
-      systemInstruction: {
-        parts: [{ text: systemInstruction }],
-      },
-      contents: [
+  const requestContents = Array.isArray(contents) && contents.length > 0
+    ? contents
+    : [
         {
           role: 'user',
           parts: [{ text: prompt }],
         },
-      ],
-      generationConfig: {
-        temperature,
-        responseMimeType: 'application/json',
-      },
-    }),
+      ];
+
+  const generationConfig = {
+    temperature,
+    responseMimeType,
+  };
+  if (Number.isFinite(Number(maxOutputTokens))) {
+    generationConfig.maxOutputTokens = Number(maxOutputTokens);
+  }
+  const requestBody = {
+    systemInstruction: {
+      parts: [{ text: systemInstruction }],
+    },
+    contents: requestContents,
+    generationConfig,
+  };
+
+  let endpoint = `https://aiplatform.googleapis.com/v1/publishers/google/models/${DEFAULT_VERTEX_MODEL}:generateContent`;
+  const headers = { 'Content-Type': 'application/json' };
+
+  if (useSearchGrounding) {
+    const projectId = getVertexProjectId();
+    if (!projectId) {
+      throw new Error('Missing GOOGLE_CLOUD_PROJECT for Vertex Search grounding');
+    }
+
+    endpoint = `https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${VERTEX_LOCATION}/publishers/google/models/${DEFAULT_VERTEX_MODEL}:generateContent`;
+    headers.Authorization = `Bearer ${await getGoogleAccessToken()}`;
+    requestBody.tools = [{ googleSearch: {} }];
+  } else {
+    headers['x-goog-api-key'] = VERTEX_API_KEY;
+  }
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(requestBody),
   });
 
   if (!response.ok) {
@@ -436,12 +618,12 @@ async function callVertexModel({ systemInstruction, prompt, temperature = 0.2 })
   }
 
   const data = await response.json();
-  const text = data?.candidates?.[0]?.content?.parts?.map((part) => part?.text || '').join('').trim() || '';
+  const text = extractVertexText(data);
   if (!text) {
     throw new Error('Vertex returned an empty response');
   }
 
-  return text;
+  return appendSources(text, useSearchGrounding ? extractGroundingSources(data) : []);
 }
 
 async function fetchVertexTranscriptSummary({ studentInfo, requestedCourses, goals, validation, reference }) {
@@ -619,6 +801,241 @@ async function fetchVertexSchedulePlan({ requestedCourses, goals, studentInfo, v
     .filter((item) => item.code && item.reason)
     .sort((a, b) => a.priority - b.priority)
     .slice(0, 5);
+}
+
+async function fetchVertexBearCardDetails({ mimeType, base64 }) {
+  const text = await callVertexModel({
+    systemInstruction: 'You extract student identity details from a student ID card image. Return JSON only.',
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { inlineData: { mimeType, data: base64 } },
+          {
+            text: "This is a Morgan State University Bear Card. Extract the student's full name and student ID number. Return ONLY valid JSON: {\"name\":\"First Last\",\"student_id\":\"123456789\"}. If unreadable, return empty strings.",
+          },
+        ],
+      },
+    ],
+    temperature: 0,
+  });
+
+  const parsed = extractJsonObject(text);
+  return {
+    name: String(parsed?.name || '').trim(),
+    student_id: String(parsed?.student_id || '').trim(),
+  };
+}
+
+async function fetchVertexChatReply({ systemPrompt, messages }) {
+  return callVertexModel({
+    systemInstruction: systemPrompt,
+    contents: messages.map((message) => ({
+      role: message.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: String(message.content || '') }],
+    })),
+    temperature: 0.3,
+    responseMimeType: 'text/plain',
+    useSearchGrounding: VERTEX_ENABLE_SEARCH_GROUNDING,
+    maxOutputTokens: 220,
+  });
+}
+
+function clampNumber(value, min, max, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, numeric));
+}
+
+async function synthesizeSpeech({
+  text,
+  languageCode = 'en-US',
+  voiceName = '',
+  speakingRate = 1,
+  pitch = 0,
+  audioEncoding = 'MP3',
+}) {
+  const cleanText = String(text || '').trim();
+  if (!cleanText) {
+    throw new Error('text is required');
+  }
+  if (cleanText.length > 5000) {
+    throw new Error('text must be 5000 characters or less');
+  }
+
+  const voice = { languageCode: String(languageCode || 'en-US') };
+  if (voiceName) voice.name = String(voiceName);
+
+  const data = await postGoogleJson('https://texttospeech.googleapis.com/v1/text:synthesize', {
+    input: { text: cleanText },
+    voice,
+    audioConfig: {
+      audioEncoding,
+      speakingRate: clampNumber(speakingRate, 0.25, 4, 1),
+      pitch: clampNumber(pitch, -20, 20, 0),
+    },
+  }, 'Text-to-Speech');
+
+  if (!data.audioContent) {
+    throw new Error('Text-to-Speech returned no audio content');
+  }
+
+  return {
+    audioContent: data.audioContent,
+    mimeType: audioEncoding === 'OGG_OPUS' ? 'audio/ogg' : 'audio/mpeg',
+    audioEncoding,
+  };
+}
+
+function inferSpeechEncoding({ mimeType, fileName, requestedEncoding }) {
+  if (requestedEncoding) return String(requestedEncoding).trim().toUpperCase();
+
+  const lowerName = String(fileName || '').toLowerCase();
+  const lowerMime = String(mimeType || '').toLowerCase();
+  if (lowerMime.includes('webm') || lowerName.endsWith('.webm')) return 'WEBM_OPUS';
+  if (lowerMime.includes('ogg') || lowerName.endsWith('.ogg') || lowerName.endsWith('.opus')) return 'OGG_OPUS';
+  if (lowerMime.includes('flac') || lowerName.endsWith('.flac')) return 'FLAC';
+  if (lowerMime.includes('mpeg') || lowerMime.includes('mp3') || lowerName.endsWith('.mp3')) return 'MP3';
+  if (lowerMime.includes('wav') || lowerMime.includes('wave') || lowerName.endsWith('.wav')) return 'LINEAR16';
+  return '';
+}
+
+async function transcribeSpeech({
+  base64,
+  mimeType,
+  fileName,
+  languageCode = 'en-US',
+  encoding = '',
+  sampleRateHertz,
+}) {
+  if (!base64) {
+    throw new Error('audio content is required');
+  }
+
+  const inferredEncoding = inferSpeechEncoding({ mimeType, fileName, requestedEncoding: encoding });
+  const config = {
+    languageCode: String(languageCode || 'en-US'),
+    enableAutomaticPunctuation: true,
+    model: 'latest_short',
+  };
+
+  if (inferredEncoding) config.encoding = inferredEncoding;
+  const numericSampleRate = Number(sampleRateHertz);
+  if (Number.isFinite(numericSampleRate) && numericSampleRate > 0) {
+    config.sampleRateHertz = numericSampleRate;
+  } else if (inferredEncoding === 'WEBM_OPUS' || inferredEncoding === 'OGG_OPUS') {
+    config.sampleRateHertz = 48000;
+  } else if (inferredEncoding === 'LINEAR16') {
+    config.sampleRateHertz = 16000;
+  }
+
+  const data = await postGoogleJson('https://speech.googleapis.com/v1/speech:recognize', {
+    config,
+    audio: { content: base64 },
+  }, 'Speech-to-Text');
+
+  const alternatives = (data.results || [])
+    .flatMap((result) => result.alternatives || [])
+    .filter((alternative) => alternative.transcript);
+
+  return {
+    transcript: alternatives.map((alternative) => alternative.transcript).join(' ').trim(),
+    confidence: alternatives.length > 0
+      ? Math.max(...alternatives.map((alternative) => Number(alternative.confidence) || 0))
+      : 0,
+    results: data.results || [],
+    encoding: inferredEncoding || 'AUTO',
+  };
+}
+
+async function fetchVertexAudit({ student, validation }) {
+  const prompt = `Audit this Morgan State CS B.S. student's degree progress.
+
+Student: ${JSON.stringify(student || {})}
+Completed core CS (${(validation?.completedCoreRequirements || []).length}/12): ${JSON.stringify(validation?.completedCoreRequirements || [])}
+Missing core CS: ${JSON.stringify(validation?.missingCoreRequirements || [])}
+Completed math (${(validation?.completedMathRequirements || []).length}/4): ${JSON.stringify(validation?.completedMathRequirements || [])}
+Missing math: ${JSON.stringify(validation?.missingMathRequirements || [])}
+Supporting completed: ${JSON.stringify(validation?.completedSupportingRequirements || [])}
+Gen Ed completed: ${JSON.stringify(validation?.completedGenEdRequirements || [])}
+Gen Ed electives: ${JSON.stringify(validation?.completedGenEdElectives || [])}
+Free electives: ${JSON.stringify(validation?.completedFreeElectives || [])}
+Unclassified: ${JSON.stringify(validation?.unknownCourses || [])}
+
+Return JSON only with exactly this shape:
+{
+  "requirements":[
+    {
+      "category":"Core CS",
+      "status":"SATISFIED|PARTIAL|MISSING",
+      "completed":["COSC111"],
+      "missing":["COSC112"],
+      "notes":"short explanation"
+    }
+  ],
+  "risks":[
+    {
+      "severity":"HIGH|MEDIUM|LOW",
+      "description":"risk summary",
+      "action":"specific next step"
+    }
+  ],
+  "overall":{
+    "overall_status":"ON_TRACK|AT_RISK|NEEDS_IMMEDIATE_ATTENTION",
+    "estimated_semesters":2,
+    "summary":"2-4 sentence summary"
+  }
+}
+
+Include requirement entries for Core CS, Mathematics, General Education, Electives, and Supporting.`;
+
+  const text = await callVertexModel({
+    systemInstruction: 'You are a precise degree audit assistant. Output valid JSON only.',
+    prompt,
+    temperature: 0.1,
+  });
+
+  const parsed = extractJsonObject(text);
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Vertex returned non-JSON audit');
+  }
+
+  return {
+    requirements: Array.isArray(parsed.requirements) ? parsed.requirements : [],
+    risks: Array.isArray(parsed.risks) ? parsed.risks : [],
+    overall: parsed.overall && typeof parsed.overall === 'object' ? parsed.overall : null,
+  };
+}
+
+async function fetchVertexAgentSchedule({ student, validation, reference, goals, requestedCourses }) {
+  const recommendations = await fetchVertexSchedulePlan({
+    requestedCourses,
+    goals,
+    studentInfo: student,
+    validation,
+    reference,
+  });
+
+  return {
+    courses: recommendations.map((course, index) => ({
+      ...course,
+      semester: index < 3 ? 'Next Term' : 'Following Term',
+      credit_hours: Number.isFinite(Number(course.credit_hours)) ? Number(course.credit_hours) : undefined,
+    })),
+    notes: [
+      {
+        type: 'SEQUENCING',
+        note: 'This lightweight plan is derived from the next-course recommender so the schedule endpoint stays responsive without Anthropic credits.',
+      },
+    ],
+    summary: {
+      semesters_to_graduation: Math.max(1, Math.ceil(recommendations.length / 4)),
+      summary: recommendations.length
+        ? `Recommended ${recommendations.length} upcoming course${recommendations.length === 1 ? '' : 's'} based on unmet requirements and current progress.`
+        : 'No schedule recommendations were available from the current validation data.',
+      credit_load_warning: recommendations.length > 4 ? 'Consider balancing these courses across multiple terms.' : '',
+    },
+  };
 }
 
 function buildRecommendationState({ classifiedCourses, requirementOptionMatches, reference }) {
@@ -856,8 +1273,13 @@ function buildChatSystemPrompt(context) {
 
   return [
     'You are BearAdvisor, an AI academic advisor for Morgan State University Computer Science B.S. students.',
-    'You are speaking with a student about their specific degree progress. Be concise, specific, and encouraging.',
+    'Default to short answers: 1-3 sentences or up to 3 bullets.',
+    'Only expand when the student explicitly asks for detail, a plan, or a list.',
+    'For voice-style questions, answer in 1-2 spoken sentences.',
     'Use the transcript data below to answer questions precisely. Do not guess if data is missing.',
+    VERTEX_ENABLE_SEARCH_GROUNDING
+      ? 'You may use Google Search grounding for current public facts, deadlines, policies, catalog details, and web questions. Keep source discussion brief.'
+      : '',
     '',
     student?.name ? `Student: ${student.name}${student.year ? `, ${student.year}` : ''}` : '',
     completed.length
@@ -874,244 +1296,21 @@ function buildChatSystemPrompt(context) {
       : '',
     '',
     'CS B.S. requirements: 12 core COSC courses, 4 math courses (MATH241/242/312/331), gen ed, and CS electives.',
-    'Keep responses under 200 words unless the question genuinely requires more detail.',
+    'Hard limit: 80 words unless the student asks for more.',
   ]
     .filter(Boolean)
     .join('\n');
 }
 
 async function runAuditAgent({ student, validation }) {
-  if (!anthropic) throw new Error('Anthropic API not configured');
-
-  const tools = [
-    {
-      name: 'record_requirement',
-      description: 'Record the audit status of one degree requirement category',
-      input_schema: {
-        type: 'object',
-        properties: {
-          category: { type: 'string', description: 'e.g. "Core CS", "Mathematics", "General Education"' },
-          status: { type: 'string', enum: ['SATISFIED', 'PARTIAL', 'MISSING'] },
-          completed: { type: 'array', items: { type: 'string' } },
-          missing: { type: 'array', items: { type: 'string' } },
-          notes: { type: 'string' },
-        },
-        required: ['category', 'status', 'completed', 'missing', 'notes'],
-      },
-    },
-    {
-      name: 'add_risk',
-      description: 'Flag a graduation risk',
-      input_schema: {
-        type: 'object',
-        properties: {
-          severity: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'] },
-          description: { type: 'string' },
-          action: { type: 'string' },
-        },
-        required: ['severity', 'description', 'action'],
-      },
-    },
-    {
-      name: 'finalize_audit',
-      description: 'Complete the audit with overall assessment',
-      input_schema: {
-        type: 'object',
-        properties: {
-          overall_status: {
-            type: 'string',
-            enum: ['ON_TRACK', 'AT_RISK', 'NEEDS_IMMEDIATE_ATTENTION'],
-          },
-          estimated_semesters: { type: 'number' },
-          summary: { type: 'string' },
-        },
-        required: ['overall_status', 'estimated_semesters', 'summary'],
-      },
-    },
-  ];
-
-  const auditResult = { requirements: [], risks: [], overall: null };
-
-  const messages = [
-    {
-      role: 'user',
-      content: `Audit this Morgan State CS B.S. student's degree progress.
-
-Student: ${JSON.stringify(student || {})}
-Completed core CS (${(validation?.completedCoreRequirements || []).length}/12): ${JSON.stringify(validation?.completedCoreRequirements || [])}
-Missing core CS: ${JSON.stringify(validation?.missingCoreRequirements || [])}
-Completed math (${(validation?.completedMathRequirements || []).length}/4): ${JSON.stringify(validation?.completedMathRequirements || [])}
-Missing math: ${JSON.stringify(validation?.missingMathRequirements || [])}
-Supporting completed: ${JSON.stringify(validation?.completedSupportingRequirements || [])}
-Gen Ed completed: ${JSON.stringify(validation?.completedGenEdRequirements || [])}
-Gen Ed electives: ${JSON.stringify(validation?.completedGenEdElectives || [])}
-Unclassified: ${JSON.stringify(validation?.unknownCourses || [])}
-
-Call record_requirement for each category (Core CS, Mathematics, General Education, Electives, Supporting).
-Call add_risk for any graduation risks you identify.
-Finish with finalize_audit.`,
-    },
-  ];
-
-  for (let i = 0; i < 10; i++) {
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 2048,
-      system: 'You are a precise degree audit agent. Systematically audit each requirement category using the tools.',
-      tools,
-      messages,
-    });
-
-    messages.push({ role: 'assistant', content: response.content });
-
-    const toolUses = response.content.filter((b) => b.type === 'tool_use');
-    if (toolUses.length === 0 || response.stop_reason === 'end_turn') break;
-
-    const results = [];
-    let done = false;
-
-    for (const tu of toolUses) {
-      if (tu.name === 'record_requirement') {
-        auditResult.requirements.push(tu.input);
-        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Recorded.' });
-      } else if (tu.name === 'add_risk') {
-        auditResult.risks.push(tu.input);
-        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Recorded.' });
-      } else if (tu.name === 'finalize_audit') {
-        auditResult.overall = tu.input;
-        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Audit finalized.' });
-        done = true;
-      }
-    }
-
-    messages.push({ role: 'user', content: results });
-    if (done) break;
-  }
-
-  return auditResult;
+  return fetchVertexAudit({ student, validation });
 }
 
 async function runScheduleAgent({ student, validation, reference, goals, requestedCourses }) {
-  if (!anthropic) throw new Error('Anthropic API not configured');
-
-  const protectedCodes = new Set(
-    (validation?.completedOrProtectedCourses || []).map(normalizeCourseCode)
-  );
-  const candidates = (validation?.recommendationCandidates || []).filter(
-    (c) => !protectedCodes.has(normalizeCourseCode(c.code))
-  );
-
-  const tools = [
-    {
-      name: 'add_course_to_plan',
-      description: 'Add a course to the multi-semester plan',
-      input_schema: {
-        type: 'object',
-        properties: {
-          code: { type: 'string' },
-          name: { type: 'string' },
-          semester: { type: 'string', description: 'e.g. "Fall 2026"' },
-          reason: { type: 'string' },
-          priority: { type: 'number' },
-          credit_hours: { type: 'number' },
-        },
-        required: ['code', 'name', 'semester', 'reason', 'priority'],
-      },
-    },
-    {
-      name: 'add_planning_note',
-      description: 'Add a scheduling note or constraint',
-      input_schema: {
-        type: 'object',
-        properties: {
-          note: { type: 'string' },
-          type: {
-            type: 'string',
-            enum: ['PREREQUISITE', 'SEQUENCING', 'WORKLOAD', 'GOAL_ALIGNMENT'],
-          },
-        },
-        required: ['note', 'type'],
-      },
-    },
-    {
-      name: 'finalize_plan',
-      description: 'Complete the plan with summary',
-      input_schema: {
-        type: 'object',
-        properties: {
-          semesters_to_graduation: { type: 'number' },
-          summary: { type: 'string' },
-          credit_load_warning: { type: 'string' },
-        },
-        required: ['semesters_to_graduation', 'summary'],
-      },
-    },
-  ];
-
-  const planResult = { courses: [], notes: [], summary: null };
-
-  const messages = [
-    {
-      role: 'user',
-      content: `Create an optimized multi-semester course plan for this Morgan State CS B.S. student.
-
-Student: ${JSON.stringify({ ...(student || {}), goals: goals || 'Not specified' })}
-Already completed/protected: ${JSON.stringify([...protectedCodes])}
-Available to schedule: ${JSON.stringify(candidates)}
-Requested by student: ${JSON.stringify((requestedCourses || []).map(normalizeCourseCode))}
-
-Key constraints:
-- MATH241 → MATH242 (Calc I before Calc II)
-- COSC111 → COSC112 (intro sequence)
-- COSC490 (Capstone I) and COSC459 (Capstone II) need senior standing
-- Recommend at most 5 courses per semester for a reasonable workload
-
-Use add_course_to_plan for each recommended course (up to 8 courses across next 2-3 semesters).
-Use add_planning_note for key sequencing constraints.
-Finish with finalize_plan.`,
-    },
-  ];
-
-  for (let i = 0; i < 10; i++) {
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 2048,
-      system: 'You are a course scheduling agent. Create an optimal multi-semester plan using the provided tools.',
-      tools,
-      messages,
-    });
-
-    messages.push({ role: 'assistant', content: response.content });
-
-    const toolUses = response.content.filter((b) => b.type === 'tool_use');
-    if (toolUses.length === 0 || response.stop_reason === 'end_turn') break;
-
-    const results = [];
-    let done = false;
-
-    for (const tu of toolUses) {
-      if (tu.name === 'add_course_to_plan') {
-        planResult.courses.push(tu.input);
-        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Added.' });
-      } else if (tu.name === 'add_planning_note') {
-        planResult.notes.push(tu.input);
-        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Noted.' });
-      } else if (tu.name === 'finalize_plan') {
-        planResult.summary = tu.input;
-        results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Plan finalized.' });
-        done = true;
-      }
-    }
-
-    messages.push({ role: 'user', content: results });
-    if (done) break;
-  }
-
-  planResult.courses.sort((a, b) => (a.priority || 0) - (b.priority || 0));
-  return planResult;
+  return fetchVertexAgentSchedule({ student, validation, reference, goals, requestedCourses });
 }
 
-async function persistSession({ student, confirmationId, classifiedCourses, validationSummary }) {
+async function persistSession({ student, confirmationId, validationSummary }) {
   if (!db) return null;
   try {
     const studentRes = await db.query(
@@ -1441,11 +1640,11 @@ app.get('/api/courses/reference', async (req, res) => {
 
 /**
  * POST /api/bear-card/extract
- * Use Anthropic vision to extract student name + ID from Bear Card image.
+ * Use Vertex multimodal generation to extract student name + ID from Bear Card image.
  */
 app.post('/api/bear-card/extract', upload.single('bearCard'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
-  if (!anthropic) return res.status(503).json({ error: 'Anthropic API not configured' });
+  if (!VERTEX_API_KEY) return res.status(503).json({ error: 'Vertex API not configured' });
 
   const supportedTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
   if (!supportedTypes.has(req.file.mimetype)) {
@@ -1455,33 +1654,11 @@ app.post('/api/bear-card/extract', upload.single('bearCard'), async (req, res) =
   try {
     const imageBuffer = fs.readFileSync(req.file.path);
     const base64 = imageBuffer.toString('base64');
-
-    const result = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 256,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'image',
-              source: { type: 'base64', media_type: req.file.mimetype, data: base64 },
-            },
-            {
-              type: 'text',
-              text: "This is a Morgan State University Bear Card (student ID card). Extract the student's full name and student ID number. Return ONLY valid JSON with no markdown: {\"name\": \"First Last\", \"student_id\": \"123456789\"}. If you cannot read the card, return {\"name\": \"\", \"student_id\": \"\"}.",
-            },
-          ],
-        },
-      ],
-    });
-
-    const text = result.content[0]?.text || '';
-    const parsed = extractJsonObject(text);
+    const parsed = await fetchVertexBearCardDetails({ mimeType: req.file.mimetype, base64 });
 
     res.json({
-      name: String(parsed?.name || '').trim(),
-      student_id: String(parsed?.student_id || '').trim(),
+      name: parsed.name,
+      student_id: parsed.student_id,
     });
   } catch (err) {
     console.error('Bear Card OCR error:', err.message);
@@ -1493,11 +1670,11 @@ app.post('/api/bear-card/extract', upload.single('bearCard'), async (req, res) =
 
 /**
  * POST /api/chat
- * Anthropic streaming chat with per-session transcript context.
+ * Vertex-backed chat with per-session transcript context.
  * Responds with text/event-stream (SSE).
  */
 app.post('/api/chat', async (req, res) => {
-  if (!anthropic) return res.status(503).json({ error: 'Anthropic API not configured' });
+  if (!VERTEX_API_KEY) return res.status(503).json({ error: 'Vertex API not configured' });
 
   const { sessionId, message, context } = req.body || {};
   if (!sessionId || !message?.trim()) {
@@ -1518,24 +1695,14 @@ app.post('/api/chat', async (req, res) => {
   res.flushHeaders();
 
   try {
-    let fullResponse = '';
-
-    const stream = anthropic.messages.stream({
-      model: 'claude-opus-4-6',
-      max_tokens: 1024,
-      system: buildChatSystemPrompt(session.context),
+    const fullResponse = await fetchVertexChatReply({
+      systemPrompt: buildChatSystemPrompt(session.context),
       messages: session.messages.slice(-20),
     });
 
-    stream.on('text', (text) => {
-      fullResponse += text;
-      res.write(`data: ${JSON.stringify({ text })}\n\n`);
-    });
-
-    await stream.finalMessage();
-
     session.messages.push({ role: 'assistant', content: fullResponse });
 
+    res.write(`data: ${JSON.stringify({ text: fullResponse })}\n\n`);
     res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
     res.end();
   } catch (err) {
@@ -1546,11 +1713,76 @@ app.post('/api/chat', async (req, res) => {
 });
 
 /**
+ * POST /api/voice/tts
+ * Convert assistant text to playable speech using Google Cloud Text-to-Speech.
+ */
+app.post('/api/voice/tts', async (req, res) => {
+  if (!GOOGLE_APPLICATION_CREDENTIALS && !GOOGLE_ACCESS_TOKEN) {
+    return res.status(503).json({ error: 'Google OAuth credentials not configured' });
+  }
+
+  const { text, languageCode, voiceName, speakingRate, pitch, audioEncoding } = req.body || {};
+  try {
+    const audio = await synthesizeSpeech({
+      text,
+      languageCode,
+      voiceName,
+      speakingRate,
+      pitch,
+      audioEncoding,
+    });
+    res.json({ success: true, ...audio });
+  } catch (err) {
+    console.error('Text-to-speech error:', err.message);
+    res.status(500).json({ error: err.message || 'Text-to-speech failed' });
+  }
+});
+
+/**
+ * POST /api/voice/stt
+ * Convert uploaded speech audio to text using Google Cloud Speech-to-Text.
+ */
+app.post('/api/voice/stt', upload.single('audio'), async (req, res) => {
+  if (!GOOGLE_APPLICATION_CREDENTIALS && !GOOGLE_ACCESS_TOKEN) {
+    return res.status(503).json({ error: 'Google OAuth credentials not configured' });
+  }
+  if (!req.file) return res.status(400).json({ error: 'No audio uploaded' });
+
+  const { languageCode, encoding, sampleRateHertz, saveAudio } = req.body || {};
+  try {
+    const audioBuffer = fs.readFileSync(req.file.path);
+    let savedAudioPath = '';
+    if (String(saveAudio || '').toLowerCase() === 'true') {
+      const voiceOutputDir = path.join(__dirname, '.agent-output');
+      fs.mkdirSync(voiceOutputDir, { recursive: true });
+      const safeExtension = path.extname(req.file.originalname || '') || path.extname(req.file.path) || '.webm';
+      const savedName = `chat-voice-${Date.now()}${safeExtension}`;
+      savedAudioPath = path.join(voiceOutputDir, savedName);
+      fs.copyFileSync(req.file.path, savedAudioPath);
+    }
+    const result = await transcribeSpeech({
+      base64: audioBuffer.toString('base64'),
+      mimeType: req.file.mimetype,
+      fileName: req.file.originalname,
+      languageCode,
+      encoding,
+      sampleRateHertz,
+    });
+    res.json({ success: true, ...result, savedAudioPath });
+  } catch (err) {
+    console.error('Speech-to-text error:', err.message);
+    res.status(500).json({ error: err.message || 'Speech-to-text failed' });
+  } finally {
+    if (req.file?.path) setTimeout(() => fs.unlink(req.file.path, () => {}), 1000);
+  }
+});
+
+/**
  * POST /api/audit
- * Degree audit agent using Anthropic tool use.
+ * Degree audit agent using Vertex.
  */
 app.post('/api/audit', async (req, res) => {
-  if (!anthropic) return res.status(503).json({ error: 'Anthropic API not configured' });
+  if (!VERTEX_API_KEY) return res.status(503).json({ error: 'Vertex API not configured' });
 
   const { sessionId, student, validation } = req.body || {};
   if (!validation) return res.status(400).json({ error: 'validation data required' });
@@ -1566,10 +1798,10 @@ app.post('/api/audit', async (req, res) => {
 
 /**
  * POST /api/schedule-agent
- * Multi-semester schedule planning agent using Anthropic tool use.
+ * Multi-semester schedule planning agent using Vertex.
  */
 app.post('/api/schedule-agent', async (req, res) => {
-  if (!anthropic) return res.status(503).json({ error: 'Anthropic API not configured' });
+  if (!VERTEX_API_KEY) return res.status(503).json({ error: 'Vertex API not configured' });
 
   const { sessionId, student, validation, goals, requestedCourses } = req.body || {};
   if (!validation) return res.status(400).json({ error: 'validation data required' });

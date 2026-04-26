@@ -21,6 +21,8 @@ export const ENDPOINTS = {
   submitManual: '/api/submit-manual',
   extractBearCard: '/api/bear-card/extract',
   chat: '/api/chat',
+  textToSpeech: '/api/voice/tts',
+  speechToText: '/api/voice/stt',
   audit: '/api/audit',
   scheduleAgent: '/api/schedule-agent',
   sessions: '/api/sessions',

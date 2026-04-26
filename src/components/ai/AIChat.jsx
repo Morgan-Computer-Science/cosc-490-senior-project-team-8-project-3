@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useAdvising } from '../../context/AdvisingContext';
-import { streamChatMessage } from '../../api/advising';
+import { speechToText, streamChatMessage, textToSpeech } from '../../api/advising';
 
 export default function AIChat() {
   const { state } = useAdvising();
@@ -14,8 +14,16 @@ export default function AIChat() {
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [voiceError, setVoiceError] = useState('');
+  const [voiceStatus, setVoiceStatus] = useState('');
+  const [speakingId, setSpeakingId] = useState('');
   const messagesEndRef = useRef(null);
   const cancelRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const audioRef = useRef(null);
+  const messageIdRef = useRef(0);
 
   // Scroll to bottom when messages change
   useEffect(() => {
@@ -23,7 +31,11 @@ export default function AIChat() {
   }, [messages, open]);
 
   // Clean up any active stream on unmount
-  useEffect(() => () => cancelRef.current?.(), []);
+  useEffect(() => () => {
+    cancelRef.current?.();
+    mediaRecorderRef.current?.stream?.getTracks?.().forEach((track) => track.stop());
+    if (audioRef.current) audioRef.current.pause();
+  }, []);
 
   const sessionId = state.confirmationId || 'default-session';
 
@@ -35,50 +47,167 @@ export default function AIChat() {
       }
     : null;
 
-  const send = () => {
-    if (!input.trim() || isLoading) return;
+  const playText = async (text, id = 'voice-reply') => {
+    if (!text) return;
 
-    const userText = input.trim();
-    const aiMsgId = `ai-${Date.now()}`;
+    setSpeakingId(id);
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+
+    const result = await textToSpeech({ text });
+    const audio = new Audio(`data:${result.mimeType};base64,${result.audioContent}`);
+    audioRef.current = audio;
+    audio.onended = () => setSpeakingId('');
+    audio.onerror = () => {
+      setVoiceError('Could not play the generated audio.');
+      setSpeakingId('');
+    };
+    await audio.play();
+  };
+
+  const send = (overrideText, options = {}) => {
+    const textToSend = String(overrideText ?? input).trim();
+    if (!textToSend || isLoading) return Promise.resolve('');
+
+    const userText = textToSend;
+    messageIdRef.current += 1;
+    const idBase = messageIdRef.current;
+    const aiMsgId = `ai-${idBase}`;
     setInput('');
     setIsLoading(true);
+    setVoiceError('');
+    setVoiceStatus(options.voice ? 'Thinking...' : '');
 
     setMessages((m) => [
       ...m,
-      { role: 'user', text: userText, id: `user-${Date.now()}` },
+      { role: 'user', text: userText, id: `user-${idBase}` },
       { role: 'ai', text: '', id: aiMsgId, streaming: true },
     ]);
 
-    cancelRef.current = streamChatMessage({
-      sessionId,
-      message: userText,
-      context: chatContext,
-      onText: (text) => {
-        setMessages((m) =>
-          m.map((msg) =>
-            msg.id === aiMsgId ? { ...msg, text: msg.text + text } : msg
-          )
-        );
-      },
-      onDone: () => {
-        setMessages((m) =>
-          m.map((msg) => (msg.id === aiMsgId ? { ...msg, streaming: false } : msg))
-        );
-        setIsLoading(false);
-        cancelRef.current = null;
-      },
-      onError: (err) => {
-        setMessages((m) =>
-          m.map((msg) =>
-            msg.id === aiMsgId
-              ? { ...msg, text: err || 'Something went wrong. Try again.', streaming: false }
-              : msg
-          )
-        );
-        setIsLoading(false);
-        cancelRef.current = null;
-      },
+    return new Promise((resolve) => {
+      let fullReply = '';
+      cancelRef.current = streamChatMessage({
+        sessionId,
+        message: userText,
+        context: chatContext,
+        onText: (text) => {
+          fullReply += text;
+          setMessages((m) =>
+            m.map((msg) =>
+              msg.id === aiMsgId ? { ...msg, text: msg.text + text } : msg
+            )
+          );
+        },
+        onDone: async () => {
+          setMessages((m) =>
+            m.map((msg) => (msg.id === aiMsgId ? { ...msg, streaming: false } : msg))
+          );
+          setIsLoading(false);
+          cancelRef.current = null;
+
+          if (options.speakReply && fullReply.trim()) {
+            try {
+              setVoiceStatus('Speaking...');
+              await playText(fullReply, aiMsgId);
+            } catch (err) {
+              setVoiceError(err.message || 'Text-to-speech failed.');
+            }
+          }
+          setVoiceStatus('');
+          resolve(fullReply);
+        },
+        onError: (err) => {
+          const errorText = err || 'Something went wrong. Try again.';
+          setMessages((m) =>
+            m.map((msg) =>
+              msg.id === aiMsgId
+                ? { ...msg, text: errorText, streaming: false }
+                : msg
+            )
+          );
+          setVoiceError(options.voice ? errorText : '');
+          setVoiceStatus('');
+          setIsLoading(false);
+          cancelRef.current = null;
+          resolve('');
+        },
+      });
     });
+  };
+
+  const speak = async (message) => {
+    if (!message?.text || message.streaming) return;
+
+    try {
+      setSpeakingId(message.id);
+      setVoiceError('');
+      await playText(message.text, message.id);
+    } catch (err) {
+      setVoiceError(err.message || 'Text-to-speech failed.');
+      setSpeakingId('');
+    }
+  };
+
+  const transcribeRecording = async (blob) => {
+    try {
+      setVoiceError('');
+      setVoiceStatus('Transcribing...');
+      const result = await speechToText({ audioBlob: blob, saveAudio: true });
+      if (result.transcript) {
+        setVoiceStatus(result.savedAudioPath ? 'Saved recording. Asking BearAdvisor...' : 'Asking BearAdvisor...');
+        await send(result.transcript, { speakReply: true, voice: true });
+      } else {
+        setVoiceError('I could not hear any speech in that recording.');
+        setVoiceStatus('');
+      }
+    } catch (err) {
+      setVoiceError(err.message || 'Speech-to-text failed.');
+      setVoiceStatus('');
+    }
+  };
+
+  const toggleRecording = async () => {
+    if (isRecording) {
+      mediaRecorderRef.current?.stop();
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setVoiceError('This browser does not support microphone recording.');
+      return;
+    }
+
+    try {
+      setVoiceError('');
+      setVoiceStatus('');
+      audioChunksRef.current = [];
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const preferredType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : '';
+      const recorder = new MediaRecorder(stream, preferredType ? { mimeType: preferredType } : undefined);
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) audioChunksRef.current.push(event.data);
+      };
+      recorder.onstop = () => {
+        setIsRecording(false);
+        setVoiceStatus('Saving recording...');
+        stream.getTracks().forEach((track) => track.stop());
+        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+        if (blob.size > 0) transcribeRecording(blob);
+      };
+
+      recorder.start();
+      setIsRecording(true);
+      setVoiceStatus('Recording...');
+    } catch (err) {
+      setVoiceError(err.message || 'Microphone access failed.');
+      setIsRecording(false);
+    }
   };
 
   if (!open) {
@@ -148,16 +277,58 @@ export default function AIChat() {
             {m.text || (m.streaming ? (
               <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>thinking...</span>
             ) : '')}
+            {m.role === 'ai' && m.text && !m.streaming && (
+              <button
+                onClick={() => speak(m)}
+                title="Read this response aloud"
+                style={{
+                  display: 'block', marginTop: '0.45rem', background: 'transparent',
+                  border: '1px solid var(--border)', color: 'var(--muted)', borderRadius: '8px',
+                  padding: '0.25rem 0.45rem', cursor: 'pointer', fontSize: '0.74rem',
+                }}
+              >
+                {speakingId === m.id ? 'Playing...' : 'Speak'}
+              </button>
+            )}
           </div>
         ))}
         <div ref={messagesEndRef} />
       </div>
 
       {/* Input */}
+      {voiceError && (
+        <div style={{
+          padding: '0.45rem 0.75rem', borderTop: '1px solid var(--border)',
+          color: '#fca5a5', fontSize: '0.75rem',
+        }}>
+          {voiceError}
+        </div>
+      )}
+      {voiceStatus && !voiceError && (
+        <div style={{
+          padding: '0.45rem 0.75rem', borderTop: '1px solid var(--border)',
+          color: 'var(--accent)', fontSize: '0.75rem',
+        }}>
+          {voiceStatus}
+        </div>
+      )}
       <div style={{
         padding: '0.75rem', borderTop: '1px solid var(--border)',
         display: 'flex', gap: '0.5rem',
       }}>
+        <button
+          onClick={toggleRecording}
+          disabled={isLoading || (!!voiceStatus && !isRecording)}
+          title={isRecording ? 'Stop and ask BearAdvisor' : 'Record, ask, and play response'}
+          style={{
+            background: isRecording ? '#f87171' : 'var(--surface2)', color: isRecording ? '#0c0e14' : 'var(--text)',
+            border: '1px solid var(--border)', borderRadius: '8px', width: '40px',
+            cursor: isLoading || (!!voiceStatus && !isRecording) ? 'not-allowed' : 'pointer', fontSize: '0.7rem',
+            opacity: isLoading || (!!voiceStatus && !isRecording) ? 0.5 : 1,
+          }}
+        >
+          {isRecording ? 'Stop' : 'Mic'}
+        </button>
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -172,7 +343,7 @@ export default function AIChat() {
           }}
         />
         <button
-          onClick={send}
+          onClick={() => send()}
           disabled={isLoading || !input.trim()}
           style={{
             background: 'var(--accent)', color: '#0c0e14', border: 'none',

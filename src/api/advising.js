@@ -62,6 +62,29 @@ export async function extractBearCard(file) {
   return handleJsonResponse(res);
 }
 
+export async function textToSpeech({ text, languageCode = 'en-US', voiceName = '', speakingRate = 1 }) {
+  const res = await fetch(`${API_BASE}${ENDPOINTS.textToSpeech}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, languageCode, voiceName, speakingRate }),
+  });
+  return handleJsonResponse(res);
+}
+
+export async function speechToText({ audioBlob, languageCode = 'en-US', saveAudio = false }) {
+  const payload = new FormData();
+  const extension = audioBlob.type.includes('ogg') ? 'ogg' : 'webm';
+  payload.append('audio', audioBlob, `voice-prompt.${extension}`);
+  payload.append('languageCode', languageCode);
+  if (saveAudio) payload.append('saveAudio', 'true');
+
+  const res = await fetch(`${API_BASE}${ENDPOINTS.speechToText}`, {
+    method: 'POST',
+    body: payload,
+  });
+  return handleJsonResponse(res);
+}
+
 /**
  * Opens an SSE connection to /api/chat and calls callbacks as data arrives.
  * Returns a cleanup function.
