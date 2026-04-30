@@ -91,8 +91,11 @@ export async function speechToText({ audioBlob, languageCode = 'en-US', saveAudi
  */
 export function streamChatMessage({ sessionId, message, context, onText, onDone, onError }) {
   const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
 
   (async () => {
+    let finished = false;
+    let receivedText = false;
     try {
       const res = await fetch(`${API_BASE}${ENDPOINTS.chat}`, {
         method: 'POST',
@@ -123,20 +126,39 @@ export function streamChatMessage({ sessionId, message, context, onText, onDone,
           if (!line.startsWith('data: ')) continue;
           try {
             const data = JSON.parse(line.slice(6));
-            if (data.text) onText(data.text);
-            if (data.done) onDone();
-            if (data.error) onError(data.error);
+            if (data.text) {
+              receivedText = true;
+              onText(data.text);
+            }
+            if (data.done) {
+              finished = true;
+              onDone();
+            }
+            if (data.error) {
+              finished = true;
+              onError(data.error);
+            }
           } catch {
             // skip malformed SSE line
           }
         }
       }
+      if (!finished) {
+        if (receivedText) onDone();
+        else onError('Chat ended before a response was received.');
+      }
     } catch (err) {
-      if (err.name !== 'AbortError') onError(err.message);
+      if (err.name === 'AbortError') onError('Chat request timed out. Try again in a minute.');
+      else onError(err.message);
+    } finally {
+      clearTimeout(timeout);
     }
   })();
 
-  return () => controller.abort();
+  return () => {
+    clearTimeout(timeout);
+    controller.abort();
+  };
 }
 
 export async function runAudit({ sessionId, student, validation }) {

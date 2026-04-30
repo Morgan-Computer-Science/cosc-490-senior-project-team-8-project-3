@@ -64,6 +64,7 @@ const GOOGLE_ACCESS_TOKEN = process.env.GOOGLE_ACCESS_TOKEN || '';
 const GOOGLE_CLOUD_PROJECT = process.env.GOOGLE_CLOUD_PROJECT || '';
 const VERTEX_LOCATION = process.env.VERTEX_LOCATION || 'us-central1';
 const VERTEX_ENABLE_SEARCH_GROUNDING = String(process.env.VERTEX_ENABLE_SEARCH_GROUNDING || '').toLowerCase() === 'true';
+const VERTEX_TIMEOUT_MS = Number(process.env.VERTEX_TIMEOUT_MS || 45000);
 
 if (!VERTEX_API_KEY) console.warn('VERTEX_API_KEY not set — AI features disabled');
 if (!GOOGLE_APPLICATION_CREDENTIALS && !GOOGLE_ACCESS_TOKEN) {
@@ -606,14 +607,30 @@ async function callVertexModel({
     headers['x-goog-api-key'] = VERTEX_API_KEY;
   }
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(requestBody),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), VERTEX_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(requestBody),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`Vertex request timed out after ${Math.round(VERTEX_TIMEOUT_MS / 1000)}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
+    if (response.status === 429) {
+      throw new Error('Vertex quota/rate limit reached. Wait a minute and try again.');
+    }
     throw new Error(`Vertex request failed: ${response.status} ${errorText}`);
   }
 
