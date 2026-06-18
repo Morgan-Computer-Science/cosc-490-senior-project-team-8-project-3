@@ -1,0 +1,27 @@
+Test Academic Transcript
+
+Student: Test Student
+ID: A000D7ZA
+
+COMPLETED COURSES:
+
+COSC111 - Introduction to Computer Science I - Grade: A
+COSC112 - Introduction to Computer Science II - Grade: B+
+MATH241 - Calculus I - Grade: A
+MATH242 - Calculus II - Grade: B
+COSC220 - Data Structures and Algorithms - Grade: A
+COSC238 - Object-Oriented Programming - Grade: B+
+MATH312 - Linear Algebra - Grade: A
+
+ENGL101 - Freshman Composition - Grade: B
+HIST101 - World History - Grade: B+
+PHYS101 - Physics I - Grade: A
+
+COSC281 - Discrete Structures - Grade: B
+COSC349 - Computer Networks - Grade: A
+
+Course Not In Curriculum: UNKN500 - Unknown Course - Grade: C
+
+IN PROGRESS:
+COSC241 - Computer Systems and Digital Logic - Grade: Pending
+COSC243 - Computer Architecture - Grade: Pending

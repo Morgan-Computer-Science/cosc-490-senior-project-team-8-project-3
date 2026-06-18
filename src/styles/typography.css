@@ -1,0 +1,17 @@
+.font-serif {
+  font-family: 'Fraunces', serif;
+}
+
+.font-mono {
+  font-family: 'DM Mono', monospace;
+}
+
+h1, h2, h3 {
+  font-family: 'Fraunces', serif;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+}
+
+code, pre, .mono {
+  font-family: 'DM Mono', monospace;
+}

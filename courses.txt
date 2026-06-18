@@ -1,0 +1,16 @@
+MATH101|Calculus I
+MATH102|Calculus II
+MATH201|Linear Algebra
+CS110|Introduction to Computer Science
+CS210|Data Structures
+CS310|Algorithms
+PHYS101|Physics I
+PHYS102|Physics II
+CHEM101|Chemistry I
+CHEM102|Chemistry II
+ENG101|English Composition
+ENG201|Literature
+HIST101|World History
+PSYCH101|Introduction to Psychology
+BIO101|Biology I
+BIO102|Biology II
